@@ -186,13 +186,13 @@ type
     data*: AttestationData
     signature*: ValidatorSig
 
-  # https://github.com/ethereum/consensus-specs/blob/v1.5.0-beta.1/specs/phase0/validator.md#aggregateandproof
+  # https://github.com/ethereum/consensus-specs/blob/v1.5.0-beta.2/specs/phase0/validator.md#aggregateandproof
   AggregateAndProof* = object
     aggregator_index*: uint64 # `ValidatorIndex` after validation
     aggregate*: Attestation
     selection_proof*: ValidatorSig
 
-  # https://github.com/ethereum/consensus-specs/blob/v1.5.0-beta.1/specs/phase0/validator.md#signedaggregateandproof
+  # https://github.com/ethereum/consensus-specs/blob/v1.5.0-beta.2/specs/phase0/validator.md#signedaggregateandproof
   SignedAggregateAndProof* = object
     message*: AggregateAndProof
     signature*: ValidatorSig
@@ -257,7 +257,7 @@ type
     # Slot at which the aggregate signature was created (untrusted)
     signature_slot*: Slot
 
-  # https://github.com/ethereum/consensus-specs/blob/v1.4.0-beta.5/specs/altair/light-client/sync-protocol.md#lightclientoptimisticupdate
+  # https://github.com/ethereum/consensus-specs/blob/v1.5.0-beta.2/specs/altair/light-client/sync-protocol.md#lightclientoptimisticupdate
   LightClientOptimisticUpdate* = object
     # Header attested to by the sync committee
     attested_header*: LightClientHeader
@@ -809,7 +809,7 @@ func normalize_merkle_branch*[N](
     res[0 ..< depth] = branch[num_extra ..< branch.len]
   res
 
-# https://github.com/ethereum/consensus-specs/blob/v1.5.0-alpha.8/specs/electra/light-client/fork.md#upgrading-light-client-data
+# https://github.com/ethereum/consensus-specs/blob/v1.5.0-beta.3/specs/electra/light-client/fork.md#upgrading-light-client-data
 func upgrade_lc_header_to_electra*(
     pre: deneb.LightClientHeader): LightClientHeader =
   LightClientHeader(
@@ -964,11 +964,10 @@ template asTrusted*(
        MsgTrustedSignedBeaconBlock): TrustedSignedBeaconBlock =
   isomorphicCast[TrustedSignedBeaconBlock](x)
 
-debugComment "this whole section with getValidatorIndices/shortLog needs refactoring and probably can be combined with identical implementations elsewhere"
-
 from std/sets import toHashSet
 
-iterator getValidatorIndices*(attester_slashing: AttesterSlashing | TrustedAttesterSlashing): uint64 =
+iterator getValidatorIndices*(
+    attester_slashing: AttesterSlashing | TrustedAttesterSlashing): uint64 =
   template attestation_1(): auto = attester_slashing.attestation_1
   template attestation_2(): auto = attester_slashing.attestation_2
 

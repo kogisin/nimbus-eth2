@@ -113,9 +113,9 @@ ifneq ($(OS), Windows_NT)
 PLATFORM_SPECIFIC_TARGETS += gnosis-build
 endif
 
-# We don't need these `vendor/holesky` files but fetching them
-# may trigger 'This repository is over its data quota' from GitHub
-GIT_SUBMODULE_CONFIG := -c lfs.fetchexclude=/public-keys/all.txt,/custom_config_data/genesis.ssz
+# We don't need these `vendor/holesky` and `vendor/hoodi` files but
+# fetching them may trigger 'This repository is over its data quota' from GitHub
+GIT_SUBMODULE_CONFIG := -c lfs.fetchexclude=/public-keys/all.txt,/metadata/genesis.ssz,/parsed/parsedConsensusGenesis.json
 
 ifeq ($(NIM_PARAMS),)
 # "variables.mk" was not included, so we update the submodules.
@@ -124,7 +124,7 @@ ifeq ($(NIM_PARAMS),)
 # with Ctrl+C after deleting the working copy and before getting a chance to
 # restore it in $(BUILD_SYSTEM_DIR).
 
-# `vendor/holesky` requires Git LFS
+# `vendor/holesky` and `vendor/hoodi` require Git LFS
 ifeq (, $(shell which git-lfs))
 ifeq ($(shell uname), Darwin)
 $(error Git LFS not installed. Run 'brew install git-lfs' to set up)
@@ -210,10 +210,10 @@ libbacktrace:
 # - --base-el-rpc-port + --el-port-offset * [0, --nodes + --light-clients)
 # - --base-el-ws-port + --el-port-offset * [0, --nodes + --light-clients)
 # - --base-el-auth-rpc-port + --el-port-offset * [0, --nodes + --light-clients)
-UNIT_TEST_BASE_PORT := 39960
-REST_TEST_BASE_PORT := 40990
-MINIMAL_TESTNET_BASE_PORT := 35001
-MAINNET_TESTNET_BASE_PORT := 36501
+UNIT_TEST_BASE_PORT := 29960
+REST_TEST_BASE_PORT := 30990
+MINIMAL_TESTNET_BASE_PORT := 25001
+MAINNET_TESTNET_BASE_PORT := 26501
 
 restapi-test:
 	./tests/simulation/restapi.sh \
