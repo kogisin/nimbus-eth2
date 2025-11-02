@@ -12,19 +12,21 @@
 
 import
   std/[typetraits, os, options, json, sequtils, uri, algorithm],
-  testutils/unittests, chronicles, stint, json_serialization, confutils,
-  chronos, blscurve, libp2p/crypto/crypto as lcrypto,
+  unittest2,
+  chronicles,
+  chronos,
+  chronos/unittest2/asynctests,
+  confutils,
+  json_serialization,
   stew/[byteutils, io2],
-
   ../beacon_chain/spec/[crypto, keystore, eth2_merkleization],
   ../beacon_chain/spec/datatypes/base,
   ../beacon_chain/spec/eth2_apis/[rest_keymanager_calls, rest_keymanager_types],
-  ../beacon_chain/validators/[keystore_management, slashing_protection_common,
-                              validator_pool],
+  ../beacon_chain/validators/
+    [keystore_management, slashing_protection_common, validator_pool],
   ../beacon_chain/networking/network_metadata,
   ../beacon_chain/rpc/rest_key_management_api,
-  ../beacon_chain/[conf, filepath, beacon_node,
-                   nimbus_beacon_node, beacon_node_status],
+  ../beacon_chain/[conf, filepath, beacon_node, nimbus_beacon_node, process_state],
   ../beacon_chain/validator_client/common,
   ../ncli/ncli_testnet,
   ./testutil
@@ -136,9 +138,9 @@ const
   nodeValidatorsDir = nodeDataDir / "validators"
   nodeSecretsDir = nodeDataDir / "secrets"
 
-  vcDataDir = dataDir / "validator-0"
-  vcValidatorsDir = vcDataDir / "validators"
-  vcSecretsDir = vcDataDir / "secrets"
+  # vcDataDir = dataDir / "validator-0"
+  # vcValidatorsDir = vcDataDir / "validators"
+  # vcSecretsDir = vcDataDir / "secrets"
 
 func specifiedFeeRecipient(x: int): Eth1Address =
   copyMem(addr result, unsafeAddr x, sizeof x)
@@ -209,7 +211,6 @@ BELLATRIX_FORK_EPOCH: 0
     "--total-validators=" & $simulationDepositsCount,
     "--deposits-file=" & depositsFile,
     "--output-genesis=" & genesisFile,
-    "--output-deposit-tree-snapshot=" & depositTreeSnapshotFile,
     "--output-bootstrap-file=" & bootstrapEnrFile,
     "--netkey-file=network_key.json",
     "--insecure-netkey-password=true",
@@ -233,7 +234,7 @@ proc addDynamicValidator(kmtest: KeymanagerToTest,
       pubkey: pubkey,
       remotes: @[
         RemoteSignerInfo(
-          url: HttpHostUri(HttpHostUri(parseUri("http://127.0.0.1"))),
+          url: HttpHostUri(parseUri("http://127.0.0.1")),
           pubkey: pubkey
         )
       ],
@@ -340,33 +341,42 @@ proc initBeaconNode(basePort: int): Future[BeaconNode] {.async: (raises: []).} =
   except CatchableError as exc:
     raiseAssert exc.msg
 
-  let runNodeConf = try: BeaconNodeConf.load(cmdLine = mapIt([
-    "--tcp-port=" & $(basePort + PortKind.PeerToPeer.ord),
-    "--udp-port=" & $(basePort + PortKind.PeerToPeer.ord),
-    "--discv5=off",
-    "--network=" & dataDir,
-    "--data-dir=" & nodeDataDir,
-    "--validators-dir=" & nodeValidatorsDir,
-    "--secrets-dir=" & nodeSecretsDir,
-    "--metrics-address=127.0.0.1",
-    "--metrics-port=" & $(basePort + PortKind.Metrics.ord),
-    "--rest=true",
-    "--rest-address=127.0.0.1",
-    "--rest-port=" & $(basePort + PortKind.KeymanagerBN.ord),
-    "--no-el",
-    "--keymanager=true",
-    "--keymanager-address=127.0.0.1",
-    "--keymanager-port=" & $(basePort + PortKind.KeymanagerBN.ord),
-    "--keymanager-token-file=" & tokenFilePath,
-    "--suggested-fee-recipient=" & $defaultFeeRecipient,
-    "--doppelganger-detection=off"], it))
-  except Exception as exc: # TODO fix confutils exceptions
-    raiseAssert exc.msg
+  let
+    metadata =
+      try:
+        loadEth2NetworkMetadata(dataDir).expect("Metadata is compatible")
+      except IOError as exc:
+        raiseAssert exc.msg
+      except PresetFileError as exc:
+        raiseAssert exc.msg
+
+    runNodeConf = try: BeaconNodeConf.load(cmdLine = mapIt([
+      "--tcp-port=" & $(basePort + PortKind.PeerToPeer.ord),
+      "--udp-port=" & $(basePort + PortKind.PeerToPeer.ord),
+      "--discv5=off",
+      "--network=" & dataDir,
+      "--data-dir=" & nodeDataDir,
+      "--validators-dir=" & nodeValidatorsDir,
+      "--secrets-dir=" & nodeSecretsDir,
+      "--metrics-address=127.0.0.1",
+      "--metrics-port=" & $(basePort + PortKind.Metrics.ord),
+      "--rest=true",
+      "--rest-address=127.0.0.1",
+      "--rest-port=" & $(basePort + PortKind.KeymanagerBN.ord),
+      "--no-el",
+      "--keymanager=true",
+      "--keymanager-address=127.0.0.1",
+      "--keymanager-port=" & $(basePort + PortKind.KeymanagerBN.ord),
+      "--keymanager-token-file=" & tokenFilePath,
+      "--suggested-fee-recipient=" & $defaultFeeRecipient,
+      "--doppelganger-detection=off",
+      "--sync-horizon=" & $(metadata.cfg.timeParams.defaultSyncHorizon)], it))
+    except Exception as exc: # TODO fix confutils exceptions
+      raiseAssert exc.msg
 
   try:
-    let metadata =
-      loadEth2NetworkMetadata(dataDir).expect("Metadata is compatible")
-    await BeaconNode.init(rng, runNodeConf, metadata)
+    let taskpool = Taskpool.new()
+    await BeaconNode.init(rng, runNodeConf, metadata, taskpool)
   except CatchableError as exc:
     raiseAssert exc.msg
 
@@ -1900,9 +1910,7 @@ proc runTests(keymanager: KeymanagerToTest) {.async.} =
         decoded =
           try:
             RestJson.decode(response.data,
-                            DataEnclosedObject[seq[RemoteKeystoreStatus]],
-                            requireAllFields = true,
-                            allowUnknownFields = true)
+                            DataEnclosedObject[seq[RemoteKeystoreStatus]])
           except SerializationError:
             raiseAssert "Invalid response encoding"
       check:
@@ -1932,9 +1940,7 @@ proc runTests(keymanager: KeymanagerToTest) {.async.} =
         decoded =
           try:
             RestJson.decode(response.data,
-                            DataEnclosedObject[seq[RemoteKeystoreStatus]],
-                            requireAllFields = true,
-                            allowUnknownFields = true)
+                            DataEnclosedObject[seq[RemoteKeystoreStatus]])
           except SerializationError:
             raiseAssert "Invalid response encoding"
       check:
@@ -1965,9 +1971,7 @@ proc runTests(keymanager: KeymanagerToTest) {.async.} =
         decoded =
           try:
             RestJson.decode(response.data,
-                            DataEnclosedObject[seq[RemoteKeystoreStatus]],
-                            requireAllFields = true,
-                            allowUnknownFields = true)
+                            DataEnclosedObject[seq[RemoteKeystoreStatus]])
           except SerializationError:
             raiseAssert "Invalid response encoding"
       check:
@@ -1997,9 +2001,7 @@ proc runTests(keymanager: KeymanagerToTest) {.async.} =
         decoded =
           try:
             RestJson.decode(response.data,
-                            DataEnclosedObject[seq[RemoteKeystoreStatus]],
-                            requireAllFields = true,
-                            allowUnknownFields = true)
+                            DataEnclosedObject[seq[RemoteKeystoreStatus]])
           except SerializationError:
             raiseAssert "Invalid response encoding"
       check:
@@ -2022,15 +2024,15 @@ proc delayedTests(basePort: int, pool: ref ValidatorPool,
       validatorPool: pool,
       keymanagerHost: host)
 
-    validatorClientKeymanager = KeymanagerToTest(
-      ident: "Validator Client",
-      port: basePort + PortKind.KeymanagerVC.ord,
-      validatorsDir: vcValidatorsDir,
-      secretsDir: vcSecretsDir,
-      validatorPool: pool,
-      keymanagerHost: host)
+    # validatorClientKeymanager = KeymanagerToTest(
+    #   ident: "Validator Client",
+    #   port: basePort + PortKind.KeymanagerVC.ord,
+    #   validatorsDir: vcValidatorsDir,
+    #   secretsDir: vcSecretsDir,
+    #   validatorPool: pool,
+    #   keymanagerHost: host)
 
-  while bnStatus != BeaconNodeStatus.Running:
+  while not ProcessState.running:
     await sleepAsync(1.seconds)
 
   # asyncSpawn startValidatorClient(basePort)
@@ -2045,9 +2047,12 @@ proc delayedTests(basePort: int, pool: ref ValidatorPool,
   # Re-enable it in a follow-up PR
   # await runTests(validatorClientKeymanager)
 
-  bnStatus = BeaconNodeStatus.Stopping
+  ProcessState.scheduleStop("stop")
 
 proc main(basePort: int) {.async.} =
+  # Overwrite the standard nim stop handlers
+  ProcessState.setupStopHandlers()
+
   if dirExists(dataDir):
     os.removeDir dataDir
 
@@ -2058,7 +2063,7 @@ proc main(basePort: int) {.async.} =
   asyncSpawn delayedTests(basePort, node.attachedValidators,
                           node.keymanagerHost)
 
-  node.start()
+  node.run(nil)
 
 let
   basePortStr = os.getEnv("NIMBUS_TEST_KEYMANAGER_BASE_PORT", $defaultBasePort)

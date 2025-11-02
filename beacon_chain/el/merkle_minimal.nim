@@ -7,19 +7,18 @@
 
 {.push raises: [].}
 
-# https://github.com/ethereum/consensus-specs/blob/v1.5.0-beta.3/tests/core/pyspec/eth2spec/utils/merkle_minimal.py
+# https://github.com/ethereum/consensus-specs/blob/v1.5.0-beta.4/tests/core/pyspec/eth2spec/utils/merkle_minimal.py
 
 # Merkle tree helpers
 # ---------------------------------------------------------------
 
 import
-  std/sequtils,
-  stew/endians2,
-  # Specs
   ../spec/[eth2_merkleization, digest],
   ../spec/datatypes/base
 
-template getProof*(
+from std/sequtils import mapIt
+
+template getProof(
     proofs: seq[Eth2Digest], idxParam: int): openArray[Eth2Digest] =
   let
     idx = idxParam

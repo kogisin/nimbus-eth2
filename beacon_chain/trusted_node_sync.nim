@@ -5,7 +5,7 @@
 #   * Apache v2 license (license terms in the root directory or at https://www.apache.org/licenses/LICENSE-2.0).
 # at your option. This file may not be copied, modified, or distributed except according to those terms.
 
-{.push raises: [].}
+{.push raises: [], gcsafe.}
 
 import
   stew/base10,
@@ -14,30 +14,15 @@ import
   ./consensus_object_pools/[block_clearance, blockchain_dag],
   ./spec/eth2_apis/rest_beacon_client,
   ./spec/[beaconstate, eth2_merkleization, forks, light_client_sync,
-          network, presets,
-          state_transition, deposit_snapshots]
+          network, presets, state_transition]
 
 from presto import RestDecodingError
 from "."/beacon_clock import
-  BeaconClock, fromFloatSeconds, getBeaconTimeFn, init
+  BeaconClock, fromFloatSeconds, currentSlot, init
 
 const
-  largeRequestsTimeout = 3.minutes  # Downloading large items such as states.
+  largeRequestsTimeout = 6.minutes  # Downloading large items such as states.
   smallRequestsTimeout = 30.seconds # Downloading smaller items such as blocks and deposit snapshots.
-
-proc fetchDepositSnapshot(
-    client: RestClientRef
-): Future[Result[DepositContractSnapshot, string]] {.async.} =
-  let resp = try:
-    awaitWithTimeout(client.getDepositSnapshot(), smallRequestsTimeout):
-      return err "Fetching /eth/v1/beacon/deposit_snapshot timed out"
-  except CatchableError as e:
-    return err("The trusted node likely does not support the /eth/v1/beacon/deposit_snapshot end-point:" & e.msg)
-
-  let snapshot = DepositContractSnapshot.init(resp.data.data).valueOr:
-    return err "The obtained deposit snapshot contains self-contradictory data"
-
-  ok snapshot
 
 from ./spec/datatypes/deneb import asSigVerified, shortLog
 
@@ -78,7 +63,6 @@ proc doTrustedNodeSync*(
     syncTarget: TrustedNodeSyncTarget,
     backfill: bool,
     reindex: bool,
-    downloadDepositSnapshot: bool,
     genesisState: ref ForkedHashedBeaconState = nil) {.async.} =
   logScope:
     restUrl
@@ -191,10 +175,9 @@ proc doTrustedNodeSync*(
         doAssert genesisState != nil, "Already checked for `TrustedBlockRoot`"
         let
           genesisTime = getStateField(genesisState[], genesis_time)
-          beaconClock = BeaconClock.init(genesisTime).valueOr:
+          beaconClock = BeaconClock.init(cfg.timeParams, genesisTime).valueOr:
             error "Invalid genesis time in state", genesisTime
             quit 1
-          getBeaconTime = beaconClock.getBeaconTimeFn()
 
           genesis_validators_root =
             getStateField(genesisState[], genesis_validators_root)
@@ -235,7 +218,7 @@ proc doTrustedNodeSync*(
             optimistic =
               store.optimistic_header.beacon.slot.sync_committee_period
             current =
-              getBeaconTime().slotOrZero().sync_committee_period
+              beaconClock.currentSlot.sync_committee_period
             isNextSyncCommitteeKnown =
               store.is_next_sync_committee_known
 
@@ -278,7 +261,7 @@ proc doTrustedNodeSync*(
             updates[i].migrateToDataFork(lcDataFork)
             let res = process_light_client_update(
               store, updates[i].forky(lcDataFork),
-              getBeaconTime().slotOrZero(), cfg, genesis_validators_root)
+              beaconClock.currentSlot, cfg, genesis_validators_root)
             if not res.isOk:
               error "`process_light_client_update` failed", resError = res.error
               quit 1
@@ -303,7 +286,7 @@ proc doTrustedNodeSync*(
 
         let res = process_light_client_update(
           store, finalityUpdate.forky(lcDataFork),
-          getBeaconTime().slotOrZero(), cfg, genesis_validators_root)
+          beaconClock.currentSlot, cfg, genesis_validators_root)
         if not res.isOk:
           error "`process_light_client_update` failed", resError = res.error
           quit 1
@@ -386,20 +369,6 @@ proc doTrustedNodeSync*(
     else:
       ChainDAGRef.preInit(db, state[])
 
-    if downloadDepositSnapshot:
-      # Fetch deposit snapshot.  This API endpoint is still optional.
-      let depositSnapshot = await fetchDepositSnapshot(client)
-      if depositSnapshot.isOk:
-        if depositSnapshot.get.matches(getStateField(state[], eth1_data)):
-          info "Writing deposit contracts snapshot",
-               depositRoot = depositSnapshot.get.getDepositRoot(),
-               depositCount = depositSnapshot.get.getDepositCountU64
-          db.putDepositContractSnapshot(depositSnapshot.get)
-        else:
-          warn "The downloaded deposit snapshot does not agree with the downloaded state"
-      else:
-        warn "Deposit tree snapshot was not imported", reason = depositSnapshot.error
-
   else:
     notice "Skipping checkpoint download, database already exists (remove db directory to get a fresh snapshot)",
       databaseDir, head = shortLog(head.get())
@@ -407,7 +376,8 @@ proc doTrustedNodeSync*(
   # Coming this far, we've done what ChainDAGRef.preInit would normally do -
   # we can now load a ChainDAG to start backfilling it
   let
-    validatorMonitor = newClone(ValidatorMonitor.init(false, false))
+    validatorMonitor = newClone(
+      ValidatorMonitor.init(cfg.timeParams, false, false))
     dag = ChainDAGRef.init(cfg, db, validatorMonitor, {}, eraPath = eraDir)
     backfillSlot = max(dag.backfill.slot, 1.Slot) - 1
     horizon = max(dag.horizon, dag.frontfill.valueOr(BlockId()).slot)
@@ -555,5 +525,5 @@ when isMainModule:
     db = BeaconChainDB.new(databaseDir, cfg, inMemory = false)
   waitFor db.doTrustedNodeSync(
     cfg, databaseDir, os.paramStr(3),
-    os.paramStr(4), syncTarget, backfill, false, true)
+    os.paramStr(4), syncTarget, backfill, false)
   db.close()

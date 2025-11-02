@@ -160,7 +160,7 @@ suite baseDescription & "Execution Payload " & preset():
   func makeApplyExecutionPayloadCb(path: string): auto =
     return proc(
         preState: var capella.BeaconState, body: capella.BeaconBlockBody):
-        Result[void, cstring] {.raises: [IOError].} =
+        Result[void, cstring] =
       let payloadValid = os_ops.readFile(
           OpExecutionPayloadDir/"pyspec_tests"/path/"execution.yaml"
         ).contains("execution_valid: true")
@@ -173,7 +173,7 @@ suite baseDescription & "Execution Payload " & preset():
               assignClone(preState)[].hash_tree_root())))
       func executePayload(_: capella.ExecutionPayload): bool = payloadValid
       process_execution_payload(
-        preState, body.execution_payload, executePayload)
+        defaultRuntimeConfig, preState, body.execution_payload, executePayload)
 
   for path in walkTests(OpExecutionPayloadDir):
     let applyExecutionPayload = makeApplyExecutionPayloadCb(path)

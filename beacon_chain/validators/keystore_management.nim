@@ -11,7 +11,7 @@ import
   std/[os, unicode, sequtils],
   chronicles, chronos, json_serialization,
   bearssl/rand,
-  serialization, blscurve, eth/common/eth_types, confutils,
+  serialization, blscurve, confutils,
   nimbus_security_resources,
   ".."/spec/[eth2_merkleization, keystore, crypto],
   ".."/spec/datatypes/base,
@@ -87,6 +87,7 @@ type
     validatorPool*: ref ValidatorPool
     keystoreCache*: KeystoreCacheRef
     rng*: ref HmacDrbgContext
+    timeParams*: TimeParams
     keymanagerToken*: string
     validatorsDir*: string
     secretsDir*: string
@@ -126,6 +127,7 @@ func init*(T: type KeymanagerHost,
            validatorPool: ref ValidatorPool,
            keystoreCache: KeystoreCacheRef,
            rng: ref HmacDrbgContext,
+           timeParams: TimeParams,
            keymanagerToken: string,
            validatorsDir: string,
            secretsDir: string,
@@ -142,6 +144,7 @@ func init*(T: type KeymanagerHost,
   T(validatorPool: validatorPool,
     keystoreCache: keystoreCache,
     rng: rng,
+    timeParams: timeParams,
     keymanagerToken: keymanagerToken,
     validatorsDir: validatorsDir,
     secretsDir: secretsDir,
@@ -1672,7 +1675,7 @@ proc generateDeposits*(cfg: RuntimeConfig,
     var derivedKey = baseKey
     defer: burnMem(derivedKey)
     derivedKey = deriveChildKey(derivedKey, validatorIdx)
-    derivedKey = deriveChildKey(derivedKey, 0) # This is witdrawal key
+    derivedKey = deriveChildKey(derivedKey, 0) # This is withdrawal key
     let withdrawalPubKey = derivedKey.toPubKey
     derivedKey = deriveChildKey(derivedKey, 0) # This is the signing key
     let signingPubKey = derivedKey.toPubKey
@@ -1693,7 +1696,7 @@ proc generateDeposits*(cfg: RuntimeConfig,
     var derivedKey = baseKey
     defer: burnMem(derivedKey)
     derivedKey = deriveChildKey(derivedKey, validatorIdx)
-    derivedKey = deriveChildKey(derivedKey, 0) # This is witdrawal key
+    derivedKey = deriveChildKey(derivedKey, 0) # This is withdrawal key
     let withdrawalPubKey = derivedKey.toPubKey
     derivedKey = deriveChildKey(derivedKey, 0) # This is the signing key
     let signingPubKey = derivedKey.toPubKey

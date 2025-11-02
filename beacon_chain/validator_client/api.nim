@@ -1,11 +1,11 @@
 # beacon_chain
-# Copyright (c) 2021-2024 Status Research & Development GmbH
+# Copyright (c) 2021-2025 Status Research & Development GmbH
 # Licensed and distributed under either of
 #   * MIT license (license terms in the root directory or at https://opensource.org/licenses/MIT).
 #   * Apache v2 license (license terms in the root directory or at https://www.apache.org/licenses/LICENSE-2.0).
 # at your option. This file may not be copied, modified, or distributed except according to those terms.
 
-{.push raises: [].}
+{.push raises: [], gcsafe.}
 
 import std/strutils
 import chronicles, stew/base10
@@ -49,6 +49,17 @@ type
     data*: ApiResponse[T]
     score*: X
 
+  DoubleTimeoutState {.pure.} = enum
+    Soft, Hard
+
+  DoubleTimeout* = object
+    startTime: Moment
+    softTimeout: Duration
+    hardTimeout: Duration
+    betweenTimeout: Duration
+    timeoutFuture*: Future[void].Raising([CancelledError])
+    state: DoubleTimeoutState
+
 const
   ViableNodeStatus* = {
     RestBeaconNodeStatus.Compatible,
@@ -56,6 +67,70 @@ const
     RestBeaconNodeStatus.OptSynced,
     RestBeaconNodeStatus.Synced
   }
+
+proc init(
+    t: typedesc[DoubleTimeout],
+    softTimeout, hardTimeout: Duration
+): DoubleTimeout =
+  let
+    betweenTimeout =
+      if softTimeout == InfiniteDuration:
+        ZeroDuration
+      else:
+        if hardTimeout == InfiniteDuration:
+          ZeroDuration
+        else:
+          doAssert(hardTimeout >= softTimeout,
+            "Hard timeout should be bigger than soft timeout")
+          hardTimeout - softTimeout
+    future =
+      if softTimeout == InfiniteDuration:
+        nil
+      else:
+        sleepAsync(softTimeout)
+
+  DoubleTimeout(
+    startTime: Moment.now(),
+    softTimeout: softTimeout,
+    hardTimeout: hardTimeout,
+    betweenTimeout: betweenTimeout,
+    timeoutFuture: future,
+    state: DoubleTimeoutState.Soft
+  )
+
+func timedOut(dt: DoubleTimeout): bool =
+  if isNil(dt.timeoutFuture):
+    false
+  else:
+    dt.timeoutFuture.finished()
+
+func hardTimedOut(dt: DoubleTimeout): bool =
+  (dt.state == DoubleTimeoutState.Hard) and dt.timedOut()
+
+func softTimedOut(dt: DoubleTimeout): bool =
+  (dt.state == DoubleTimeoutState.Hard) or
+    ((dt.state == DoubleTimeoutState.Soft) and dt.timedOut())
+
+proc switch(dt: var DoubleTimeout) =
+  if dt.state == DoubleTimeoutState.Hard:
+    # It's too late to switch, so doing nothing
+    return
+  if not(dt.timedOut()):
+    # Timeout is not exceeded yet, so doing nothing
+    return
+  dt.state = DoubleTimeoutState.Hard
+  dt.timeoutFuture =
+    if dt.hardTimeout == InfiniteDuration:
+      nil
+    else:
+      sleepAsync(dt.betweenTimeout)
+
+proc timePassed(dt: DoubleTimeout): Duration =
+  Moment.now() - dt.startTime
+
+proc close(dt: DoubleTimeout): Future[void] {.async: (raises: []).} =
+  if not(isNil(dt.timeoutFuture)):
+    await cancelAndWait(dt.timeoutFuture)
 
 proc `$`*[T](s: ApiScore[T]): string =
   var res = Base10.toString(uint64(s.index))
@@ -95,7 +170,7 @@ proc lazyWaiter(
     strategy: ApiStrategyKind
 ) {.async: (raises: []).} =
   try:
-    await allFutures(request)
+    await request.join()
     if request.failed():
       let failure = ApiNodeFailure.init(
         ApiFailure.Communication, requestName, strategy, node,
@@ -129,6 +204,42 @@ proc lazyWait(
       await cancelAndWait(timerFut)
   else:
     await allFutures(futures)
+
+proc lazyWait(
+    nodes: seq[BeaconNodeServerRef],
+    requests: seq[FutureBase],
+    timeout: ref DoubleTimeout,
+    requestName: string,
+    strategy: ApiStrategyKind
+) {.async: (raises: [CancelledError]).} =
+  doAssert(len(nodes) == len(requests))
+  if len(nodes) == 0:
+    return
+
+  var futures: seq[Future[void]]
+  for index in 0 ..< len(requests):
+    futures.add(lazyWaiter(nodes[index], requests[index], requestName,
+                           strategy))
+
+  if isNil(timeout[].timeoutFuture):
+    await allFutures(futures)
+    return
+
+  while true:
+    try:
+      await allFutures(futures).wait(timeout[].timeoutFuture)
+      # All pending jobs finished successfully, exiting
+      break
+    except AsyncTimeoutError:
+      if timeout[].hardTimedOut():
+        # Hard timeout exceeded, terminating all the jobs.
+        let pending =
+          futures.filterIt(not(it.finished())).mapIt(it.cancelAndWait())
+        await noCancel allFutures(pending)
+        break
+      else:
+        # Soft timeout exceeded, switching to hard timeout future.
+        timeout[].switch()
 
 proc apiResponseOr[T](future: FutureBase, timerFut: Future[void],
                       message: string): ApiResponse[T] =
@@ -278,27 +389,22 @@ template firstSuccessParallel*(
   retRes
 
 template bestSuccess*(
-           vc: ValidatorClientRef,
-           responseType: typedesc,
-           handlerType: typedesc,
-           scoreType: typedesc,
-           timeout: Duration,
-           statuses: set[RestBeaconNodeStatus],
-           roles: set[BeaconNodeRole],
-           bodyRequest,
-           bodyScore,
-           bodyHandler: untyped): ApiResponse[handlerType] =
+    vc: ValidatorClientRef,
+    responseType: typedesc,
+    handlerType: typedesc,
+    scoreType: typedesc,
+    softTimeout: Duration,
+    hardTimeout: Duration,
+    statuses: set[RestBeaconNodeStatus],
+    roles: set[BeaconNodeRole],
+    bodyRequest,
+    bodyScore,
+    bodyHandler: untyped
+): ApiResponse[handlerType] =
   var
     it {.inject.}: RestClientRef
     iterations = 0
-
-  var timerFut =
-    if timeout != InfiniteDuration:
-      sleepAsync(timeout)
-    else:
-      nil
-
-  var
+    timeout = newClone(DoubleTimeout.init(softTimeout, hardTimeout))
     retRes: ApiResponse[handlerType]
     scores: seq[ApiScore[scoreType]]
     bestResponse: Opt[BestNodeResponse[handlerType, scoreType]]
@@ -309,26 +415,31 @@ template bestSuccess*(
         try:
           if iterations == 0:
             # We are not going to wait for BNs if there some available.
-            await vc.waitNodes(timerFut, statuses, roles, false)
+            await vc.waitNodes(timeout[].timeoutFuture, statuses, roles, false)
           else:
-            # We get here only, if all the requests are failed. To avoid requests
-            # spam we going to wait for changes in BNs statuses.
-            await vc.waitNodes(timerFut, statuses, roles, true)
+            # We get here only, if all the requests are failed. To avoid
+            # requests spam we going to wait for changes in BNs statuses.
+            await vc.waitNodes(timeout[].timeoutFuture, statuses, roles, true)
           vc.filterNodes(statuses, roles)
         except CancelledError as exc:
-          if not(isNil(timerFut)) and not(timerFut.finished()):
-            await timerFut.cancelAndWait()
+          await timeout[].close()
           raise exc
 
       if len(onlineNodes) == 0:
-        retRes = ApiResponse[handlerType].err("No online beacon node(s)")
-        break mainLoop
+        if timeout[].hardTimedOut():
+          retRes = ApiResponse[handlerType].err("No online beacon node(s)")
+          break mainLoop
+        else:
+          debug "Soft timeout exceeded while waiting for beacon node(s)",
+                time_passed = timeout[].timePassed()
+          timeout[].switch()
       else:
         var
           (pendingRequests, pendingNodes) =
             block:
-              var requests: seq[FutureBase]
-              var nodes: seq[BeaconNodeServerRef]
+              var
+                requests: seq[FutureBase]
+                nodes: seq[BeaconNodeServerRef]
               for node {.inject.} in onlineNodes:
                 it = node.client
                 let fut = FutureBase(bodyRequest)
@@ -342,24 +453,29 @@ template bestSuccess*(
             var
               finishedRequests: seq[FutureBase]
               finishedNodes: seq[BeaconNodeServerRef]
-              raceFut: Future[FutureBase].Raising([ValueError, CancelledError])
             try:
-              raceFut = race(pendingRequests)
-
-              if not(isNil(timerFut)):
-                discard await race(raceFut, timerFut)
+              if not(isNil(timeout.timeoutFuture)):
+                try:
+                  discard await race(pendingRequests).wait(
+                    timeout.timeoutFuture)
+                except ValueError:
+                  raiseAssert "pendingRequests sequence must not be empty!"
+                except AsyncTimeoutError:
+                  discard
               else:
-                await allFutures(raceFut)
+                try:
+                  discard await race(pendingRequests)
+                except ValueError:
+                  raiseAssert "pendingRequests sequence must not be empty!"
 
               for index, future in pendingRequests.pairs():
-                if future.finished() or
-                   (not(isNil(timerFut)) and timerFut.finished()):
+                if future.finished() or timeout[].hardTimedOut():
                   finishedRequests.add(future)
                   finishedNodes.add(pendingNodes[index])
                   let
                     node {.inject.} = pendingNodes[index]
                     apiResponse {.inject.} =
-                      apiResponseOr[responseType](future, timerFut,
+                      apiResponseOr[responseType](future, timeout.timeoutFuture,
                         "Timeout exceeded while awaiting for the response")
                     handlerResponse =
                       try:
@@ -378,7 +494,7 @@ template bestSuccess*(
 
                     scores.add(ApiScore.init(node, score))
                     if bestResponse.isNone() or
-                      (score > bestResponse.get().score):
+                       (score > bestResponse.get().score):
                       bestResponse = Opt.some(
                         BestNodeResponse.init(node, handlerResponse, score))
                       if perfectScore(score):
@@ -387,13 +503,18 @@ template bestSuccess*(
                   else:
                     scores.add(ApiScore.init(node, scoreType))
 
+              if timeout[].softTimedOut():
+                timeout[].switch()
+                if bestResponse.isSome():
+                  perfectScoreFound = true
+
               if perfectScoreFound:
                 # lazyWait will cancel `pendingRequests` on timeout.
-                asyncSpawn lazyWait(pendingNodes, pendingRequests, timerFut,
-                                    RequestName, strategy)
+                asyncSpawn lazyWait(
+                  pendingNodes, pendingRequests, timeout, RequestName, strategy)
                 break innerLoop
 
-              if not(isNil(timerFut)) and timerFut.finished():
+              if timeout[].hardTimedOut():
                 # If timeout is exceeded we need to cancel all the tasks which
                 # are still running.
                 var pendingCancel: seq[Future[void]]
@@ -408,11 +529,9 @@ template bestSuccess*(
 
             except CancelledError as exc:
               var pendingCancel: seq[Future[void]]
-              # `or` operation does not cancelling Futures passed as arguments.
-              if not(isNil(raceFut)) and not(raceFut.finished()):
-                pendingCancel.add(raceFut.cancelAndWait())
-              if not(isNil(timerFut)) and not(timerFut.finished()):
-                pendingCancel.add(timerFut.cancelAndWait())
+              # `race` operation does not cancelling Futures passed as
+              # arguments.
+              pendingCancel.add(timeout[].close())
               # We should cancel all the requests which are still pending.
               for future in pendingRequests.items():
                 if not(future.finished()):
@@ -425,7 +544,7 @@ template bestSuccess*(
           retRes = bestResponse.get().data
           break mainLoop
         else:
-          if timerFut.finished():
+          if timeout[].hardTimedOut():
             retRes = ApiResponse[handlerType].err(
                        "Timeout exceeded while awaiting for responses")
             break mainLoop
@@ -439,8 +558,8 @@ template bestSuccess*(
     debug "Best score result selected",
           request = RequestName, available_scores = scores,
           best_score = shortScore(bestResponse.get().score),
-          best_node = bestResponse.get().node
-
+          best_node = bestResponse.get().node,
+          time_passed = timeout[].timePassed()
   retRes
 
 template onceToAll*(
@@ -779,7 +898,7 @@ proc getProposerDuties*(
   of ApiStrategyKind.First, ApiStrategyKind.Best:
     let res = vc.firstSuccessParallel(RestPlainResponse,
                                       GetProposerDutiesResponse,
-                                      SlotDuration,
+                                      vc.SlotDuration,
                                       ViableNodeStatus,
                                       {BeaconNodeRole.Duties},
                                       getProposerDutiesPlain(it, epoch)):
@@ -819,7 +938,7 @@ proc getProposerDuties*(
 
   of ApiStrategyKind.Priority:
     vc.firstSuccessSequential(RestPlainResponse,
-                              SlotDuration,
+                              vc.SlotDuration,
                               ViableNodeStatus,
                               {BeaconNodeRole.Duties},
                               getProposerDutiesPlain(it, epoch)):
@@ -870,7 +989,7 @@ proc getAttesterDuties*(
   of ApiStrategyKind.First, ApiStrategyKind.Best:
     let res = vc.firstSuccessParallel(RestPlainResponse,
                                       GetAttesterDutiesResponse,
-                                      SlotDuration,
+                                      vc.SlotDuration,
                                       ViableNodeStatus,
                                       {BeaconNodeRole.Duties},
                                       getAttesterDutiesPlain(it, epoch,
@@ -911,7 +1030,7 @@ proc getAttesterDuties*(
 
   of ApiStrategyKind.Priority:
     vc.firstSuccessSequential(RestPlainResponse,
-                              SlotDuration,
+                              vc.SlotDuration,
                               ViableNodeStatus,
                               {BeaconNodeRole.Duties},
                               getAttesterDutiesPlain(it, epoch, validators)):
@@ -963,7 +1082,7 @@ proc getSyncCommitteeDuties*(
     let res = vc.firstSuccessParallel(
       RestPlainResponse,
       GetSyncCommitteeDutiesResponse,
-      SlotDuration,
+      vc.SlotDuration,
       ViableNodeStatus,
       {BeaconNodeRole.Duties},
       getSyncCommitteeDutiesPlain(it, epoch, validators)):
@@ -1005,7 +1124,7 @@ proc getSyncCommitteeDuties*(
   of ApiStrategyKind.Priority:
     vc.firstSuccessSequential(
       RestPlainResponse,
-      SlotDuration,
+      vc.SlotDuration,
       ViableNodeStatus,
       {BeaconNodeRole.Duties},
       getSyncCommitteeDutiesPlain(it, epoch, validators)):
@@ -1048,13 +1167,13 @@ proc getForkSchedule*(
 
   let
     resp = vc.onceToAll(RestPlainResponse,
-                        SlotDuration,
+                        vc.SlotDuration,
                         ViableNodeStatus,
                         {BeaconNodeRole.Duties},
                         getForkSchedulePlain(it))
   case resp.status
   of ApiOperation.Timeout:
-    debug "Unable to obtain fork schedule in time", timeout = SlotDuration
+    debug "Unable to obtain fork schedule in time", timeout = vc.SlotDuration
     default(seq[Fork])
   of ApiOperation.Interrupt:
     debug "Fork schedule request was interrupted"
@@ -1136,7 +1255,7 @@ proc getHeadBlockRoot*(
   of ApiStrategyKind.First:
     let res = vc.firstSuccessParallel(RestPlainResponse,
                                       GetBlockRootResponse,
-                                      SlotDuration,
+                                      vc.SlotDuration,
                                       ViableNodeStatus,
                                       {BeaconNodeRole.SyncCommitteeData},
                                       getBlockRootPlain(it, blockIdent)):
@@ -1182,7 +1301,8 @@ proc getHeadBlockRoot*(
       RestPlainResponse,
       GetBlockRootResponse,
       float64,
-      SlotDuration,
+      vc.SlotDurationSoft,
+      vc.SlotDuration,
       ViableNodeStatus,
       {BeaconNodeRole.SyncCommitteeData},
       getBlockRootPlain(it, blockIdent),
@@ -1226,7 +1346,7 @@ proc getHeadBlockRoot*(
 
   of ApiStrategyKind.Priority:
     vc.firstSuccessSequential(RestPlainResponse, #RestResponse[GetBlockRootResponse],
-                              SlotDuration,
+                              vc.SlotDuration,
                               ViableNodeStatus,
                               {BeaconNodeRole.SyncCommitteeData},
                               getBlockRootPlain(it, blockIdent)):
@@ -1283,7 +1403,7 @@ proc getValidators*(
     let res = vc.firstSuccessParallel(
       RestPlainResponse,
       GetStateValidatorsResponse,
-      SlotDuration,
+      vc.SlotDuration,
       ViableNodeStatus,
       {BeaconNodeRole.Duties},
       getStateValidatorsPlain(it, stateIdent, id)):
@@ -1323,7 +1443,7 @@ proc getValidators*(
 
   of ApiStrategyKind.Priority:
     vc.firstSuccessSequential(RestPlainResponse,
-                              SlotDuration,
+                              vc.SlotDuration,
                               ViableNodeStatus,
                               {BeaconNodeRole.Duties},
                               getStateValidatorsPlain(it, stateIdent, id)):
@@ -1375,7 +1495,7 @@ proc produceAttestationData*(
     let res = vc.firstSuccessParallel(
       RestPlainResponse,
       ProduceAttestationDataResponse,
-      OneThirdDuration,
+      vc.OneThirdDuration,
       ViableNodeStatus,
       {BeaconNodeRole.AttestationData},
       produceAttestationDataPlain(it, slot, committee_index)):
@@ -1417,7 +1537,8 @@ proc produceAttestationData*(
       RestPlainResponse,
       ProduceAttestationDataResponse,
       float64,
-      OneThirdDuration,
+      vc.OneThirdDurationSoft,
+      vc.OneThirdDuration,
       ViableNodeStatus,
       {BeaconNodeRole.AttestationData},
       produceAttestationDataPlain(it, slot, committee_index),
@@ -1457,7 +1578,7 @@ proc produceAttestationData*(
   of ApiStrategyKind.Priority:
     vc.firstSuccessSequential(
       RestPlainResponse,
-      OneThirdDuration,
+      vc.OneThirdDuration,
       ViableNodeStatus,
       {BeaconNodeRole.AttestationData},
       produceAttestationDataPlain(it, slot, committee_index)):
@@ -1494,6 +1615,7 @@ proc produceAttestationData*(
 proc submitPoolAttestationsV2*(
     vc: ValidatorClientRef,
     data: seq[ForkyAttestation],
+    fork: ConsensusFork,
     strategy: ApiStrategyKind
 ): Future[bool] {.async: (raises: [CancelledError, ValidatorApiError]).} =
   const
@@ -1505,10 +1627,10 @@ proc submitPoolAttestationsV2*(
   of ApiStrategyKind.First, ApiStrategyKind.Best:
     let res = vc.firstSuccessParallel(RestPlainResponse,
                                       bool,
-                                      SlotDuration,
+                                      vc.SlotDuration,
                                       ViableNodeStatus,
                                       {BeaconNodeRole.AttestationPublish},
-                                      submitPoolAttestationsV2(it, data)):
+                                      submitPoolAttestationsV2(it, fork, data)):
       if apiResponse.isErr():
         handleCommunicationError()
         ApiResponse[bool].err(apiResponse.error)
@@ -1533,77 +1655,10 @@ proc submitPoolAttestationsV2*(
 
   of ApiStrategyKind.Priority:
     vc.firstSuccessSequential(RestPlainResponse,
-                              SlotDuration,
+                              vc.SlotDuration,
                               ViableNodeStatus,
                               {BeaconNodeRole.AttestationPublish},
-                              submitPoolAttestationsV2(it, data)):
-      if apiResponse.isErr():
-        handleCommunicationError()
-        false
-      else:
-        let response = apiResponse.get()
-        case response.status
-        of 200:
-          return true
-        of 400:
-          handle400Indexed()
-          false
-        of 500:
-          handle500()
-          false
-        else:
-          handleUnexpectedCode()
-          false
-
-    raise (ref ValidatorApiError)(
-      msg: "Failed to submit attestations", data: failures)
-
-proc submitPoolAttestations*(
-    vc: ValidatorClientRef,
-    data: seq[phase0.Attestation],
-    strategy: ApiStrategyKind
-): Future[bool] {.async: (raises: [CancelledError, ValidatorApiError]).} =
-  const
-    RequestName = "submitPoolAttestations"
-
-  var failures: seq[ApiNodeFailure]
-
-  case strategy
-  of ApiStrategyKind.First, ApiStrategyKind.Best:
-    let res = vc.firstSuccessParallel(RestPlainResponse,
-                                      bool,
-                                      SlotDuration,
-                                      ViableNodeStatus,
-                                      {BeaconNodeRole.AttestationPublish},
-                                      submitPoolAttestations(it, data)):
-      if apiResponse.isErr():
-        handleCommunicationError()
-        ApiResponse[bool].err(apiResponse.error)
-      else:
-        let response = apiResponse.get()
-        case response.status
-        of 200:
-          ApiResponse[bool].ok(true)
-        of 400:
-          handle400Indexed()
-          ApiResponse[bool].err(ResponseInvalidError)
-        of 500:
-          handle500()
-          ApiResponse[bool].err(ResponseInternalError)
-        else:
-          handleUnexpectedCode()
-          ApiResponse[bool].err(ResponseUnexpectedError)
-
-    if res.isErr():
-      raise (ref ValidatorApiError)(msg: res.error, data: failures)
-    return res.get()
-
-  of ApiStrategyKind.Priority:
-    vc.firstSuccessSequential(RestPlainResponse,
-                              SlotDuration,
-                              ViableNodeStatus,
-                              {BeaconNodeRole.AttestationPublish},
-                              submitPoolAttestations(it, data)):
+                              submitPoolAttestationsV2(it, fork, data)):
       if apiResponse.isErr():
         handleCommunicationError()
         false
@@ -1647,7 +1702,7 @@ proc submitPoolSyncCommitteeSignature*(
     let res =  vc.firstSuccessParallel(
       RestPlainResponse,
       bool,
-      SlotDuration,
+      vc.SlotDuration,
       ViableNodeStatus,
       {BeaconNodeRole.SyncCommitteePublish},
       submitPoolSyncCommitteeSignatures(it, @[restData])):
@@ -1676,7 +1731,7 @@ proc submitPoolSyncCommitteeSignature*(
   of ApiStrategyKind.Priority:
     vc.firstSuccessSequential(
       RestPlainResponse,
-      SlotDuration,
+      vc.SlotDuration,
       ViableNodeStatus,
       {BeaconNodeRole.SyncCommitteePublish},
       submitPoolSyncCommitteeSignatures(it, @[restData])):
@@ -1718,7 +1773,7 @@ proc getAggregatedAttestation*(
     let res = vc.firstSuccessParallel(
       RestPlainResponse,
       GetAggregatedAttestationResponse,
-      OneThirdDuration,
+      vc.OneThirdDuration,
       ViableNodeStatus,
       {BeaconNodeRole.AggregatedData},
       getAggregatedAttestationPlain(it, root, slot)):
@@ -1762,7 +1817,8 @@ proc getAggregatedAttestation*(
       RestPlainResponse,
       GetAggregatedAttestationResponse,
       float64,
-      OneThirdDuration,
+      vc.OneThirdDurationSoft,
+      vc.OneThirdDuration,
       ViableNodeStatus,
       {BeaconNodeRole.AggregatedData},
       getAggregatedAttestationPlain(it, root, slot),
@@ -1808,7 +1864,7 @@ proc getAggregatedAttestation*(
   of ApiStrategyKind.Priority:
     vc.firstSuccessSequential(
       RestPlainResponse,
-      OneThirdDuration,
+      vc.OneThirdDuration,
       ViableNodeStatus,
       {BeaconNodeRole.AggregatedData},
       getAggregatedAttestationPlain(it, root, slot)):
@@ -1858,7 +1914,7 @@ proc getAggregatedAttestationV2*(
     let res = vc.firstSuccessParallel(
       RestPlainResponse,
       GetAggregatedAttestationV2Response,
-      OneThirdDuration,
+      vc.OneThirdDuration,
       ViableNodeStatus,
       {BeaconNodeRole.AggregatedData},
       getAggregatedAttestationPlainV2(it, root, slot, committee_index)):
@@ -1902,7 +1958,8 @@ proc getAggregatedAttestationV2*(
       RestPlainResponse,
       GetAggregatedAttestationV2Response,
       float64,
-      OneThirdDuration,
+      vc.OneThirdDurationSoft,
+      vc.OneThirdDuration,
       ViableNodeStatus,
       {BeaconNodeRole.AggregatedData},
       getAggregatedAttestationPlainV2(it, root, slot, committee_index),
@@ -1947,7 +2004,7 @@ proc getAggregatedAttestationV2*(
   of ApiStrategyKind.Priority:
     vc.firstSuccessSequential(
       RestPlainResponse,
-      OneThirdDuration,
+      vc.OneThirdDuration,
       ViableNodeStatus,
       {BeaconNodeRole.AggregatedData},
       getAggregatedAttestationPlainV2(it, root, slot, committee_index)):
@@ -1997,7 +2054,7 @@ proc produceSyncCommitteeContribution*(
     let res = vc.firstSuccessParallel(
       RestPlainResponse,
       ProduceSyncCommitteeContributionResponse,
-      OneThirdDuration,
+      vc.OneThirdDuration,
       ViableNodeStatus,
       {BeaconNodeRole.SyncCommitteeData},
       produceSyncCommitteeContributionPlain(it, slot, subcommitteeIndex, root)):
@@ -2039,7 +2096,8 @@ proc produceSyncCommitteeContribution*(
       RestPlainResponse,
       ProduceSyncCommitteeContributionResponse,
       float64,
-      OneThirdDuration,
+      vc.OneThirdDurationSoft,
+      vc.OneThirdDuration,
       ViableNodeStatus,
       {BeaconNodeRole.SyncCommitteeData},
       produceSyncCommitteeContributionPlain(it, slot, subcommitteeIndex, root),
@@ -2080,7 +2138,7 @@ proc produceSyncCommitteeContribution*(
   of ApiStrategyKind.Priority:
     vc.firstSuccessSequential(
       RestPlainResponse,
-      OneThirdDuration,
+      vc.OneThirdDuration,
       ViableNodeStatus,
       {BeaconNodeRole.SyncCommitteeData},
       produceSyncCommitteeContributionPlain(it, slot, subcommitteeIndex, root)):
@@ -2112,6 +2170,7 @@ proc produceSyncCommitteeContribution*(
 proc publishAggregateAndProofsV2*(
     vc: ValidatorClientRef,
     data: seq[ForkySignedAggregateAndProof],
+    fork: ConsensusFork,
     strategy: ApiStrategyKind
 ): Future[bool] {.async: (raises: [CancelledError, ValidatorApiError]).} =
   const
@@ -2121,12 +2180,10 @@ proc publishAggregateAndProofsV2*(
 
   case strategy
   of ApiStrategyKind.First, ApiStrategyKind.Best:
-    let res = vc.firstSuccessParallel(RestPlainResponse,
-                                      bool,
-                                      SlotDuration,
-                                      ViableNodeStatus,
-                                      {BeaconNodeRole.AggregatedPublish},
-                                      publishAggregateAndProofsV2(it, data)):
+    let res = vc.firstSuccessParallel(
+      RestPlainResponse, bool, vc.SlotDuration, ViableNodeStatus,
+      {BeaconNodeRole.AggregatedPublish},
+      publishAggregateAndProofsV2(it, fork, data)):
       if apiResponse.isErr():
         handleCommunicationError()
         ApiResponse[bool].err(apiResponse.error)
@@ -2153,11 +2210,10 @@ proc publishAggregateAndProofsV2*(
     res.get()
 
   of ApiStrategyKind.Priority:
-    vc.firstSuccessSequential(RestPlainResponse,
-                              SlotDuration,
-                              ViableNodeStatus,
-                              {BeaconNodeRole.AggregatedPublish},
-                              publishAggregateAndProofsV2(it, data)):
+    vc.firstSuccessSequential(
+      RestPlainResponse, vc.SlotDuration, ViableNodeStatus,
+      {BeaconNodeRole.AggregatedPublish},
+      publishAggregateAndProofsV2(it, fork, data)):
       if apiResponse.isErr():
         handleCommunicationError()
         false
@@ -2171,73 +2227,6 @@ proc publishAggregateAndProofsV2*(
           false
         of 404:
 
-          false
-        of 500:
-          handle500()
-          false
-        else:
-          handleUnexpectedCode()
-          false
-
-    raise (ref ValidatorApiError)(
-      msg: "Failed to publish aggregated attestation", data: failures)
-
-proc publishAggregateAndProofs*(
-    vc: ValidatorClientRef,
-    data: seq[phase0.SignedAggregateAndProof],
-    strategy: ApiStrategyKind
-): Future[bool] {.async: (raises: [CancelledError, ValidatorApiError]).} =
-  const
-    RequestName = "publishAggregateAndProofs"
-
-  var failures: seq[ApiNodeFailure]
-
-  case strategy
-  of ApiStrategyKind.First, ApiStrategyKind.Best:
-    let res = vc.firstSuccessParallel(RestPlainResponse,
-                                      bool,
-                                      SlotDuration,
-                                      ViableNodeStatus,
-                                      {BeaconNodeRole.AggregatedPublish},
-                                      publishAggregateAndProofs(it, data)):
-      if apiResponse.isErr():
-        handleCommunicationError()
-        ApiResponse[bool].err(apiResponse.error)
-      else:
-        let response = apiResponse.get()
-        case response.status:
-        of 200:
-          ApiResponse[bool].ok(true)
-        of 400:
-          handle400()
-          ApiResponse[bool].err(ResponseInvalidError)
-        of 500:
-          handle500()
-          ApiResponse[bool].err(ResponseInternalError)
-        else:
-          handleUnexpectedCode()
-          ApiResponse[bool].err(ResponseUnexpectedError)
-
-    if res.isErr():
-      raise (ref ValidatorApiError)(msg: res.error, data: failures)
-    return res.get()
-
-  of ApiStrategyKind.Priority:
-    vc.firstSuccessSequential(RestPlainResponse,
-                              SlotDuration,
-                              ViableNodeStatus,
-                              {BeaconNodeRole.AggregatedPublish},
-                              publishAggregateAndProofs(it, data)):
-      if apiResponse.isErr():
-        handleCommunicationError()
-        false
-      else:
-        let response = apiResponse.get()
-        case response.status:
-        of 200:
-          return true
-        of 400:
-          handle400()
           false
         of 500:
           handle500()
@@ -2264,7 +2253,7 @@ proc publishContributionAndProofs*(
   of ApiStrategyKind.First, ApiStrategyKind.Best:
     let res = vc.firstSuccessParallel(RestPlainResponse,
                                       bool,
-                                      SlotDuration,
+                                      vc.SlotDuration,
                                       ViableNodeStatus,
                                       {BeaconNodeRole.SyncCommitteePublish},
                                       publishContributionAndProofs(it, data)):
@@ -2292,7 +2281,7 @@ proc publishContributionAndProofs*(
 
   of ApiStrategyKind.Priority:
     vc.firstSuccessSequential(RestPlainResponse,
-                              SlotDuration,
+                              vc.SlotDuration,
                               ViableNodeStatus,
                               {BeaconNodeRole.SyncCommitteePublish},
                               publishContributionAndProofs(it, data)):
@@ -2337,7 +2326,8 @@ proc produceBlockV3*(
       RestPlainResponse,
       ProduceBlockResponseV3,
       UInt256,
-      SlotDuration,
+      vc.SlotDurationSoft,
+      vc.SlotDuration,
       ViableNodeStatus,
       {BeaconNodeRole.BlockProposalData},
       produceBlockV3Plain(it, slot, randao_reveal, graffiti,
@@ -2388,7 +2378,7 @@ proc produceBlockV3*(
     let res = vc.firstSuccessParallel(
       RestPlainResponse,
       ProduceBlockResponseV3,
-      SlotDuration,
+      vc.SlotDuration,
       ViableNodeStatus,
       {BeaconNodeRole.BlockProposalData},
       produceBlockV3Plain(it, slot, randao_reveal, graffiti,
@@ -2436,7 +2426,7 @@ proc produceBlockV3*(
   of ApiStrategyKind.Priority:
     vc.firstSuccessSequential(
       RestPlainResponse,
-      SlotDuration,
+      vc.SlotDuration,
       ViableNodeStatus,
       {BeaconNodeRole.BlockProposalData},
       produceBlockV3Plain(it, slot, randao_reveal, graffiti,
@@ -2495,7 +2485,7 @@ proc publishBlockV2*(
     let res = block:
       vc.firstSuccessParallel(RestPlainResponse,
                               bool,
-                              SlotDuration,
+                              vc.SlotDuration,
                               ViableNodeStatus,
                               {BeaconNodeRole.BlockProposalPublish}):
         case data.kind
@@ -2513,6 +2503,8 @@ proc publishBlockV2*(
           publishBlockV2(it, some(broadcast_validation), data.electraData)
         of ConsensusFork.Fulu:
           publishBlockV2(it, some(broadcast_validation), data.fuluData)
+        of ConsensusFork.Gloas:
+          publishBlockV2(it, some(broadcast_validation), data.gloasData)
       do:
         if apiResponse.isErr():
           handleCommunicationError()
@@ -2548,7 +2540,7 @@ proc publishBlockV2*(
 
   of ApiStrategyKind.Priority:
     vc.firstSuccessSequential(RestPlainResponse,
-                              SlotDuration,
+                              vc.SlotDuration,
                               ViableNodeStatus,
                               {BeaconNodeRole.BlockProposalPublish}):
       case data.kind
@@ -2566,6 +2558,8 @@ proc publishBlockV2*(
         publishBlockV2(it, some(broadcast_validation), data.electraData)
       of ConsensusFork.Fulu:
         publishBlockV2(it, some(broadcast_validation), data.fuluData)
+      of ConsensusFork.Gloas:
+        publishBlockV2(it, some(broadcast_validation), data.gloasData)
 
     do:
       if apiResponse.isErr():
@@ -2599,120 +2593,6 @@ proc publishBlockV2*(
     raise (ref ValidatorApiError)(
       msg: "Failed to publish block", data: failures)
 
-proc publishBlock*(
-    vc: ValidatorClientRef,
-    data: RestPublishedSignedBlockContents,
-    strategy: ApiStrategyKind
-): Future[bool] {.async: (raises: [CancelledError, ValidatorApiError]).} =
-  const
-    RequestName = "publishBlock"
-    BlockBroadcasted = "Block not passed validation, but still published"
-
-  var failures: seq[ApiNodeFailure]
-
-  case strategy
-  of ApiStrategyKind.First, ApiStrategyKind.Best:
-    let res = block:
-      vc.firstSuccessParallel(RestPlainResponse,
-                              bool,
-                              SlotDuration,
-                              ViableNodeStatus,
-                              {BeaconNodeRole.BlockProposalPublish}):
-        case data.kind
-        of ConsensusFork.Phase0:
-          publishBlock(it, data.phase0Data)
-        of ConsensusFork.Altair:
-          publishBlock(it, data.altairData)
-        of ConsensusFork.Bellatrix:
-          publishBlock(it, data.bellatrixData)
-        of ConsensusFork.Capella:
-          publishBlock(it, data.capellaData)
-        of ConsensusFork.Deneb:
-          publishBlock(it, data.denebData)
-        of ConsensusFork.Electra:
-          publishBlock(it, data.electraData)
-        of ConsensusFork.Fulu:
-          publishBlock(it, data.fuluData)
-      do:
-        if apiResponse.isErr():
-          handleCommunicationError()
-          ApiResponse[bool].err(apiResponse.error)
-        else:
-          let response = apiResponse.get()
-          case response.status:
-          of 200:
-            ApiResponse[bool].ok(true)
-          of 202:
-            debug BlockBroadcasted, node = node,
-             blck = shortLog(ForkedSignedBeaconBlock.init(data))
-            ApiResponse[bool].ok(true)
-          of 400:
-            handle400()
-            ApiResponse[bool].err(ResponseInvalidError)
-          of 500:
-            handle500()
-            ApiResponse[bool].err(ResponseInternalError)
-          of 503:
-            handle503()
-            ApiResponse[bool].err(ResponseNoSyncError)
-          else:
-            handleUnexpectedCode()
-            ApiResponse[bool].err(ResponseUnexpectedError)
-
-    if res.isErr():
-      raise (ref ValidatorApiError)(msg: res.error, data: failures)
-    return res.get()
-
-  of ApiStrategyKind.Priority:
-    vc.firstSuccessSequential(RestPlainResponse,
-                              SlotDuration,
-                              ViableNodeStatus,
-                              {BeaconNodeRole.BlockProposalPublish}):
-      case data.kind
-      of ConsensusFork.Phase0:
-        publishBlock(it, data.phase0Data)
-      of ConsensusFork.Altair:
-        publishBlock(it, data.altairData)
-      of ConsensusFork.Bellatrix:
-        publishBlock(it, data.bellatrixData)
-      of ConsensusFork.Capella:
-        publishBlock(it, data.capellaData)
-      of ConsensusFork.Deneb:
-        publishBlock(it, data.denebData)
-      of ConsensusFork.Electra:
-        publishBlock(it, data.electraData)
-      of ConsensusFork.Fulu:
-        publishBlock(it, data.fuluData)
-
-    do:
-      if apiResponse.isErr():
-        handleCommunicationError()
-        false
-      else:
-        let response = apiResponse.get()
-        case response.status:
-        of 200:
-          return true
-        of 202:
-          debug BlockBroadcasted, node = node,
-                blck = shortLog(ForkedSignedBeaconBlock.init(data))
-          return true
-        of 400:
-          handle400()
-          false
-        of 500:
-          handle500()
-          false
-        of 503:
-          handle503()
-          false
-        else:
-          handleUnexpectedCode()
-          false
-
-    raise (ref ValidatorApiError)(
-      msg: "Failed to publish block", data: failures)
-
 proc publishBlindedBlockV2*(
     vc: ValidatorClientRef,
     data: ForkedSignedBlindedBeaconBlock,
@@ -2730,31 +2610,21 @@ proc publishBlindedBlockV2*(
     let res = block:
       vc.firstSuccessParallel(RestPlainResponse,
                               bool,
-                              SlotDuration,
+                              vc.SlotDuration,
                               ViableNodeStatus,
                               {BeaconNodeRole.BlockProposalPublish}):
         case data.kind
-        of ConsensusFork.Phase0:
-          publishBlindedBlockV2(it, some(broadcast_validation),
-            data.phase0Data)
-        of ConsensusFork.Altair:
-          publishBlindedBlockV2(it, some(broadcast_validation),
-            data.altairData)
-        of ConsensusFork.Bellatrix:
-          publishBlindedBlockV2(it, some(broadcast_validation),
-            data.bellatrixData)
-        of ConsensusFork.Capella:
-          publishBlindedBlockV2(it, some(broadcast_validation),
-            data.capellaData)
-        of ConsensusFork.Deneb:
-          publishBlindedBlockV2(it, some(broadcast_validation),
-            data.denebData)
+        of ConsensusFork.Phase0 .. ConsensusFork.Deneb:
+          raiseAssert "Unable to publish block of that kind"
         of ConsensusFork.Electra:
-          publishBlindedBlockV2(it, some(broadcast_validation),
+          publishJsonBlindedBlockV2(it, some(broadcast_validation),
             data.electraData)
         of ConsensusFork.Fulu:
-          publishBlindedBlockV2(it, some(broadcast_validation),
+          publishJsonBlindedBlockV2(it, some(broadcast_validation),
             data.fuluData)
+        of ConsensusFork.Gloas:
+          debugGloasComment ""
+          return false
       do:
         if apiResponse.isErr():
           handleCommunicationError()
@@ -2789,31 +2659,21 @@ proc publishBlindedBlockV2*(
 
   of ApiStrategyKind.Priority:
     vc.firstSuccessSequential(RestPlainResponse,
-                              SlotDuration,
+                              vc.SlotDuration,
                               ViableNodeStatus,
                               {BeaconNodeRole.BlockProposalPublish}):
       case data.kind
-      of ConsensusFork.Phase0:
-        publishBlindedBlockV2(it, some(broadcast_validation),
-          data.phase0Data)
-      of ConsensusFork.Altair:
-        publishBlindedBlockV2(it, some(broadcast_validation),
-          data.altairData)
-      of ConsensusFork.Bellatrix:
-        publishBlindedBlockV2(it, some(broadcast_validation),
-          data.bellatrixData)
-      of ConsensusFork.Capella:
-        publishBlindedBlockV2(it, some(broadcast_validation),
-          data.capellaData)
-      of ConsensusFork.Deneb:
-        publishBlindedBlockV2(it, some(broadcast_validation),
-          data.denebData)
+      of ConsensusFork.Phase0 .. ConsensusFork.Deneb:
+        raiseAssert "Unable to publish block of that kind"
       of ConsensusFork.Electra:
-        publishBlindedBlockV2(it, some(broadcast_validation),
+        publishJsonBlindedBlockV2(it, some(broadcast_validation),
           data.electraData)
       of ConsensusFork.Fulu:
-        publishBlindedBlockV2(it, some(broadcast_validation),
+        publishJsonBlindedBlockV2(it, some(broadcast_validation),
           data.fuluData)
+      of ConsensusFork.Gloas:
+        debugGloasComment ""
+        return false
     do:
       if apiResponse.isErr():
         handleCommunicationError()
@@ -2861,7 +2721,7 @@ proc publishBlindedBlock*(
     let res = block:
       vc.firstSuccessParallel(RestPlainResponse,
                               bool,
-                              SlotDuration,
+                              vc.SlotDuration,
                               ViableNodeStatus,
                               {BeaconNodeRole.BlockProposalPublish}):
         case data.kind
@@ -2879,6 +2739,8 @@ proc publishBlindedBlock*(
           publishBlindedBlock(it, data.electraData)
         of ConsensusFork.Fulu:
           publishBlindedBlock(it, data.fuluData)
+        of ConsensusFork.Gloas:
+          publishBlindedBlock(it, data.gloasData)
       do:
         if apiResponse.isErr():
           handleCommunicationError()
@@ -2910,7 +2772,7 @@ proc publishBlindedBlock*(
 
   of ApiStrategyKind.Priority:
     vc.firstSuccessSequential(RestPlainResponse,
-                              SlotDuration,
+                              vc.SlotDuration,
                               ViableNodeStatus,
                               {BeaconNodeRole.BlockProposalPublish}):
       case data.kind
@@ -2928,6 +2790,8 @@ proc publishBlindedBlock*(
         publishBlindedBlock(it, data.electraData)
       of ConsensusFork.Fulu:
         publishBlindedBlock(it, data.fuluData)
+      of ConsensusFork.Gloas:
+        publishBlindedBlock(it, data.gloasData)
     do:
       if apiResponse.isErr():
         handleCommunicationError()
@@ -2962,7 +2826,7 @@ proc prepareBeaconCommitteeSubnet*(
 ): Future[int] {.async: (raises: [CancelledError, ValidatorApiError]).} =
   logScope: request = "prepareBeaconCommitteeSubnet"
   let resp = vc.onceToAll(RestPlainResponse,
-                          SlotDuration,
+                          vc.SlotDuration,
                           ViableNodeStatus,
                           {BeaconNodeRole.AggregatedData},
                           prepareBeaconCommitteeSubnet(it, data))
@@ -2975,7 +2839,7 @@ proc prepareBeaconCommitteeSubnet*(
       return 0
     of ApiOperation.Timeout:
       debug "Unable to subscribe to beacon committee subnets in time",
-            timeout = SlotDuration
+            timeout = vc.SlotDuration
       return 0
     of ApiOperation.Interrupt:
       debug "Beacon committee subscription request was interrupted"
@@ -3006,7 +2870,7 @@ proc prepareSyncCommitteeSubnets*(
 ): Future[int] {.async: (raises: [CancelledError, ValidatorApiError]).} =
   logScope: request = "prepareSyncCommitteeSubnet"
   let resp = vc.onceToAll(RestPlainResponse,
-                          SlotDuration,
+                          vc.SlotDuration,
                           ViableNodeStatus,
                           {BeaconNodeRole.SyncCommitteeData},
                           prepareSyncCommitteeSubnets(it, data))
@@ -3019,7 +2883,7 @@ proc prepareSyncCommitteeSubnets*(
       return 0
     of ApiOperation.Timeout:
       debug "Unable to prepare sync committee subnets in time",
-            timeout = SlotDuration
+            timeout = vc.SlotDuration
       return 0
     of ApiOperation.Interrupt:
       debug "Sync committee subnets preparation request was interrupted"
@@ -3049,7 +2913,7 @@ proc prepareBeaconProposer*(
 ): Future[int] {.async: (raises: [CancelledError, ValidatorApiError]).} =
   logScope: request = "prepareBeaconProposer"
   let resp = vc.onceToAll(RestPlainResponse,
-                          SlotDuration,
+                          vc.SlotDuration,
                           ViableNodeStatus,
                           {BeaconNodeRole.BlockProposalPublish},
                           prepareBeaconProposer(it, data))
@@ -3062,7 +2926,7 @@ proc prepareBeaconProposer*(
       return 0
     of ApiOperation.Timeout:
       debug "Unable to perform beacon proposer preparation request in time",
-            timeout = SlotDuration
+            timeout = vc.SlotDuration
       return 0
     of ApiOperation.Interrupt:
       debug "Beacon proposer's preparation request was interrupted"
@@ -3091,7 +2955,7 @@ proc registerValidator*(
 ): Future[int] {.async: (raises: [CancelledError, ValidatorApiError]).} =
   logScope: request = "registerValidators"
   let resp = vc.onceToAll(RestPlainResponse,
-                          SlotDuration,
+                          vc.SlotDuration,
                           ViableNodeStatus,
                           {BeaconNodeRole.BlockProposalPublish},
                           registerValidator(it, data))
@@ -3104,7 +2968,7 @@ proc registerValidator*(
       return 0
     of ApiOperation.Timeout:
       debug "Unable to register validators in time",
-            timeout = SlotDuration
+            timeout = vc.SlotDuration
       return 0
     of ApiOperation.Interrupt:
       debug "Validator registration was interrupted"
@@ -3136,14 +3000,14 @@ proc getValidatorsLiveness*(
   const
     RequestName = "getLiveness"
   let resp = vc.onceToAll(RestPlainResponse,
-                          SlotDuration,
+                          vc.SlotDuration,
                           ViableNodeStatus,
                           {BeaconNodeRole.Duties},
                           getValidatorsLiveness(it, epoch, validators))
   case resp.status
   of ApiOperation.Timeout:
     debug "Unable to perform validator's liveness request in time",
-          timeout = SlotDuration
+          timeout = vc.SlotDuration
     return GetValidatorsLivenessResponse()
   of ApiOperation.Interrupt:
     debug "Validator's liveness request was interrupted"
@@ -3246,14 +3110,14 @@ proc getFinalizedBlockHeader*(
   let
     blockIdent = BlockIdent.init(BlockIdentType.Finalized)
     resp = vc.onceToAll(RestPlainResponse,
-                        SlotDuration,
+                        vc.SlotDuration,
                         ViableNodeStatus,
                         {BeaconNodeRole.Duties},
                         getBlockHeaderPlain(it, blockIdent))
   case resp.status
   of ApiOperation.Timeout:
     debug "Unable to obtain finalized block header in time",
-          timeout = SlotDuration
+          timeout = vc.SlotDuration
     return Opt.none(GetBlockHeaderResponse)
   of ApiOperation.Interrupt:
     debug "Finalized block header request was interrupted"
@@ -3343,7 +3207,7 @@ proc submitBeaconCommitteeSelections*(
     let res =  vc.firstSuccessParallel(
       RestPlainResponse,
       SubmitBeaconCommitteeSelectionsResponse,
-      SlotDuration,
+      vc.SlotDuration,
       ViableNodeStatus,
       {BeaconNodeRole.Duties},
       submitBeaconCommitteeSelectionsPlain(it, data)):
@@ -3389,7 +3253,7 @@ proc submitBeaconCommitteeSelections*(
 
   of ApiStrategyKind.Priority:
     vc.firstSuccessSequential(RestPlainResponse,
-                              SlotDuration,
+                              vc.SlotDuration,
                               ViableNodeStatus,
                               {BeaconNodeRole.Duties},
                               submitBeaconCommitteeSelectionsPlain(it, data)):
@@ -3440,7 +3304,7 @@ proc submitSyncCommitteeSelections*(
     let res =  vc.firstSuccessParallel(
       RestPlainResponse,
       SubmitSyncCommitteeSelectionsResponse,
-      SlotDuration,
+      vc.SlotDuration,
       ViableNodeStatus,
       {BeaconNodeRole.Duties},
       submitSyncCommitteeSelectionsPlain(it, data)):
@@ -3486,7 +3350,7 @@ proc submitSyncCommitteeSelections*(
 
   of ApiStrategyKind.Priority:
     vc.firstSuccessSequential(RestPlainResponse,
-                              SlotDuration,
+                              vc.SlotDuration,
                               ViableNodeStatus,
                               {BeaconNodeRole.Duties},
                               submitSyncCommitteeSelectionsPlain(it, data)):

@@ -1,5 +1,5 @@
 # beacon_chain
-# Copyright (c) 2018-2024 Status Research & Development GmbH
+# Copyright (c) 2018-2025 Status Research & Development GmbH
 # Licensed and distributed under either of
 #   * MIT license (license terms in the root directory or at https://opensource.org/licenses/MIT).
 #   * Apache v2 license (license terms in the root directory or at https://www.apache.org/licenses/LICENSE-2.0).
@@ -142,7 +142,7 @@ proc store*(clist: ChainListRef, signedBlock: ForkedSignedBeaconBlock,
 proc checkBlobs(signedBlock: ForkedSignedBeaconBlock,
                 blobsOpt: Opt[BlobSidecars]): Result[void, VerifierError] =
   withBlck(signedBlock):
-    when consensusFork >= ConsensusFork.Deneb:
+    when consensusFork in [ConsensusFork.Deneb, ConsensusFork.Electra]:
       if blobsOpt.isSome():
         let blobs = blobsOpt.get()
 
@@ -167,7 +167,7 @@ proc checkBlobs(signedBlock: ForkedSignedBeaconBlock,
             return err(VerifierError.Invalid)
   ok()
 
-proc addBackfillBlockData*(
+proc addLightForwardBlock*(
     clist: ChainListRef, signedBlock: ForkedSignedBeaconBlock,
     blobsOpt: Opt[BlobSidecars]): Result[void, VerifierError] =
   doAssert(not(isNil(clist)))
@@ -243,5 +243,5 @@ proc untrustedBackfillVerifier*(
 ): Future[Result[void, VerifierError]] {.
   async: (raises: [CancelledError], raw: true).} =
   let retFuture = newFuture[Result[void, VerifierError]]()
-  retFuture.complete(clist.addBackfillBlockData(signedBlock, blobs))
+  retFuture.complete(clist.addLightForwardBlock(signedBlock, blobs))
   retFuture

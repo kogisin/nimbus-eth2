@@ -5,7 +5,7 @@
 #   * Apache v2 license (license terms in the root directory or at https://www.apache.org/licenses/LICENSE-2.0).
 # at your option. This file may not be copied, modified, or distributed except according to those terms.
 
-{.push raises: [].}
+{.push raises: [], gcsafe.}
 
 # Types specific to phase0 (i.e. known to have changed across hard forks) - see
 # `base` for types and guidelines common across forks
@@ -113,7 +113,7 @@ type
     data*: BeaconState
     root*: Eth2Digest # hash_tree_root(data)
 
-  # https://github.com/ethereum/consensus-specs/blob/v1.4.0/specs/phase0/beacon-chain.md#beaconblock
+  # https://github.com/ethereum/consensus-specs/blob/v1.5.0-beta.4/specs/phase0/beacon-chain.md#beaconblock
   BeaconBlock* = object
     ## For each slot, a proposer is chosen from the validator pool to propose
     ## a new block. Once the block as been proposed, it is transmitted to
@@ -221,7 +221,7 @@ type
     deposits*: List[Deposit, Limit MAX_DEPOSITS]
     voluntary_exits*: List[TrustedSignedVoluntaryExit, Limit MAX_VOLUNTARY_EXITS]
 
-  # https://github.com/ethereum/consensus-specs/blob/v1.5.0-beta.3/specs/phase0/beacon-chain.md#signedbeaconblock
+  # https://github.com/ethereum/consensus-specs/blob/v1.5.0-beta.4/specs/phase0/beacon-chain.md#signedbeaconblock
   SignedBeaconBlock* = object
     message*: BeaconBlock
     signature*: ValidatorSig
@@ -247,19 +247,13 @@ type
 
     root* {.dontSerialize.}: Eth2Digest # cached root of signed beacon block
 
-  MsgTrustedSignedBeaconBlock* = object
-    message*: TrustedBeaconBlock
-    signature*: ValidatorSig
-
-    root* {.dontSerialize.}: Eth2Digest # cached root of signed beacon block
-
   TrustedSignedBeaconBlock* = object
     message*: TrustedBeaconBlock
     signature*: TrustedSig
 
     root* {.dontSerialize.}: Eth2Digest # cached root of signed beacon block
 
-  # https://github.com/ethereum/consensus-specs/blob/v1.5.0-alpha.8/specs/phase0/beacon-chain.md#attesterslashing
+  # https://github.com/ethereum/consensus-specs/blob/v1.5.0-beta.4/specs/phase0/beacon-chain.md#attesterslashing
   AttesterSlashing* = object
     attestation_1*: IndexedAttestation
     attestation_2*: IndexedAttestation
@@ -305,7 +299,7 @@ type
     aggregate*: Attestation
     selection_proof*: ValidatorSig
 
-  # https://github.com/ethereum/consensus-specs/blob/v1.4.0/specs/phase0/validator.md#signedaggregateandproof
+  # https://github.com/ethereum/consensus-specs/blob/v1.5.0-beta.4/specs/phase0/validator.md#signedaggregateandproof
   SignedAggregateAndProof* = object
     message*: AggregateAndProof
     signature*: ValidatorSig
@@ -315,7 +309,6 @@ type
   SomeSignedBeaconBlock* =
     SignedBeaconBlock |
     SigVerifiedSignedBeaconBlock |
-    MsgTrustedSignedBeaconBlock |
     TrustedSignedBeaconBlock
   SomeBeaconBlock* =
     BeaconBlock |
@@ -406,13 +399,11 @@ template asTrusted*(x: Attestation): TrustedAttestation =
 
 template asSigned*(
     x: SigVerifiedSignedBeaconBlock |
-       MsgTrustedSignedBeaconBlock |
        TrustedSignedBeaconBlock): SignedBeaconBlock =
   isomorphicCast[SignedBeaconBlock](x)
 
 template asSigVerified*(
     x: SignedBeaconBlock |
-       MsgTrustedSignedBeaconBlock |
        TrustedSignedBeaconBlock): SigVerifiedSignedBeaconBlock =
   isomorphicCast[SigVerifiedSignedBeaconBlock](x)
 
@@ -420,16 +411,9 @@ template asSigVerified*(
     x: BeaconBlock | TrustedBeaconBlock): SigVerifiedBeaconBlock =
   isomorphicCast[SigVerifiedBeaconBlock](x)
 
-template asMsgTrusted*(
-    x: SignedBeaconBlock |
-       SigVerifiedSignedBeaconBlock |
-       TrustedSignedBeaconBlock): MsgTrustedSignedBeaconBlock =
-  isomorphicCast[MsgTrustedSignedBeaconBlock](x)
-
 template asTrusted*(
     x: SignedBeaconBlock |
-       SigVerifiedSignedBeaconBlock |
-       MsgTrustedSignedBeaconBlock): TrustedSignedBeaconBlock =
+       SigVerifiedSignedBeaconBlock): TrustedSignedBeaconBlock =
   isomorphicCast[TrustedSignedBeaconBlock](x)
 
 func init*(

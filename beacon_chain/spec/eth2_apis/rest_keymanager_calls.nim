@@ -1,5 +1,5 @@
 # beacon_chain
-# Copyright (c) 2018-2024 Status Research & Development GmbH
+# Copyright (c) 2018-2025 Status Research & Development GmbH
 # Licensed and distributed under either of
 #   * MIT license (license terms in the root directory or at https://opensource.org/licenses/MIT).
 #   * Apache v2 license (license terms in the root directory or at https://www.apache.org/licenses/LICENSE-2.0).
@@ -10,16 +10,15 @@
 import
   presto/client, chronicles,
   ".."/".."/validators/slashing_protection_common,
-  ".."/datatypes/[phase0, altair],
   ".."/[helpers, forks, keystore, eth2_ssz_serialization],
   "."/[rest_types, rest_common, rest_keymanager_types, eth2_rest_serialization]
 
 export client, rest_types, eth2_rest_serialization,
        rest_keymanager_types
 
-UUID.serializesAsBaseIn RestJson
-KeyPath.serializesAsBaseIn RestJson
-WalletName.serializesAsBaseIn RestJson
+UUID.serializesAsBase RestJson
+KeyPath.serializesAsBase RestJson
+WalletName.serializesAsBase RestJson
 
 proc raiseKeymanagerGenericError*(resp: RestPlainResponse) {.
      noreturn, raises: [RestError].} =

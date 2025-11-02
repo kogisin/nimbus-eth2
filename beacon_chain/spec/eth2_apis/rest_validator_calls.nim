@@ -1,11 +1,11 @@
 # beacon_chain
-# Copyright (c) 2018-2024 Status Research & Development GmbH
+# Copyright (c) 2018-2025 Status Research & Development GmbH
 # Licensed and distributed under either of
 #   * MIT license (license terms in the root directory or at https://opensource.org/licenses/MIT).
 #   * Apache v2 license (license terms in the root directory or at https://www.apache.org/licenses/LICENSE-2.0).
 # at your option. This file may not be copied, modified, or distributed except according to those terms.
 
-{.push raises: [].}
+{.push raises: [], gcsafe.}
 
 import
   presto/client,
@@ -71,13 +71,6 @@ proc getAggregatedAttestationPlainV2*(
     meth: MethodGet.}
   ## https://ethereum.github.io/beacon-APIs/?urls.primaryName=dev#/Validator/getAggregatedAttestationV2
 
-proc publishAggregateAndProofs*(
-       body: seq[phase0.SignedAggregateAndProof]
-     ): RestPlainResponse {.
-     rest, endpoint: "/eth/v1/validator/aggregate_and_proofs",
-     meth: MethodPost.}
-  ## https://ethereum.github.io/beacon-APIs/#/Validator/publishAggregateAndProofs
-
 proc publishAggregateAndProofsV2Plain*(
     body: seq[ForkySignedAggregateAndProof]
 ): RestPlainResponse {.
@@ -87,15 +80,14 @@ proc publishAggregateAndProofsV2Plain*(
 
 proc publishAggregateAndProofsV2*[T: ForkySignedAggregateAndProof](
     client: RestClientRef,
+    fork: ConsensusFork,
     body: seq[T]
 ): Future[RestPlainResponse] {.
    async: (raises: [CancelledError, RestEncodingError, RestDnsResolveError,
                     RestCommunicationError], raw: true).} =
   ## https://ethereum.github.io/beacon-APIs/?urls.primaryName=dev#/Validator/publishAggregateAndProofsV2
-  let
-    consensus = T.kind.toString()
   client.publishAggregateAndProofsV2Plain(
-    body, extraHeaders = @[("eth-consensus-version", consensus)])
+    body, extraHeaders = @[("eth-consensus-version", fork.toString())])
 
 proc prepareBeaconCommitteeSubnet*(
        body: seq[RestCommitteeSubscription]

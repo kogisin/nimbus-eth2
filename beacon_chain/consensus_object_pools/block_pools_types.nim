@@ -5,28 +5,25 @@
 #   * Apache v2 license (license terms in the root directory or at https://www.apache.org/licenses/LICENSE-2.0).
 # at your option. This file may not be copied, modified, or distributed except according to those terms.
 
-{.push raises: [].}
+{.push raises: [], gcsafe.}
 
 import
   # Standard library
-  std/[sets, tables, hashes],
+  std/[tables, hashes],
   # Status libraries
   chronicles,
+  results,
   # Internals
   ../spec/[signatures_batch, forks, helpers],
-  ../spec/datatypes/[phase0, altair, bellatrix],
   ".."/[beacon_chain_db, era_db],
   ../validators/validator_monitor,
   ./block_dag, block_pools_types_light_client
-
-from ../spec/datatypes/capella import TrustedSignedBeaconBlock
-from ../spec/datatypes/deneb import TrustedSignedBeaconBlock
 
 from "."/vanity_logs/vanity_logs import LogProc, VanityLogs
 
 export
   sets, tables, hashes, helpers, beacon_chain_db, era_db, block_dag,
-  block_pools_types_light_client, validator_monitor, LogProc, VanityLogs
+  block_pools_types_light_client, validator_monitor, LogProc, VanityLogs, results
 
 # ChainDAG and types related to forming a DAG of blocks, keeping track of their
 # relationships and allowing various forms of lookups
@@ -51,6 +48,8 @@ type
 
   OnBlockCallback* =
     proc(data: ForkedTrustedSignedBeaconBlock) {.gcsafe, raises: [].}
+  OnBlockGossipCallback* =
+    proc(data: ForkedSignedBeaconBlock) {.gcsafe, raises: [].}
   OnHeadCallback* =
     proc(data: HeadChangeInfoObject) {.gcsafe, raises: [].}
   OnReorgCallback* =
@@ -129,6 +128,11 @@ type
       ## caches.
 
     era*: EraDB
+
+    eaSlot*: Slot
+      ## Earliest available slot is the earliest slot at which the BN can
+      ## guarantee serving blocks (and sidecars which are a subset of slots
+      ## pertaining to the DA retention window of sidecars).
 
     validatorMonitor*: ref ValidatorMonitor
 
@@ -233,6 +237,8 @@ type
 
     onBlockAdded*: OnBlockCallback
       ## On block added callback
+    onBlockGossipAdded*: OnBlockGossipCallback
+      ## On block gossip added callback
     onHeadChanged*: OnHeadCallback
       ## On head changed callback
     onReorgHappened*: OnReorgCallback
@@ -289,24 +295,9 @@ type
     blck*: ForkedSignedBeaconBlock
     blob*: Opt[BlobSidecars]
 
-  OnBlockAdded*[T: ForkyTrustedSignedBeaconBlock] = proc(
-    blckRef: BlockRef, blck: T, epochRef: EpochRef,
-    unrealized: FinalityCheckpoints) {.gcsafe, raises: [].}
-  OnPhase0BlockAdded* = OnBlockAdded[phase0.TrustedSignedBeaconBlock]
-  OnAltairBlockAdded* = OnBlockAdded[altair.TrustedSignedBeaconBlock]
-  OnBellatrixBlockAdded* = OnBlockAdded[bellatrix.TrustedSignedBeaconBlock]
-  OnCapellaBlockAdded* = OnBlockAdded[capella.TrustedSignedBeaconBlock]
-  OnDenebBlockAdded* = OnBlockAdded[deneb.TrustedSignedBeaconBlock]
-  OnElectraBlockAdded* = OnBlockAdded[electra.TrustedSignedBeaconBlock]
-  OnFuluBlockAdded* = OnBlockAdded[fulu.TrustedSignedBeaconBlock]
-
-  OnForkyBlockAdded* =
-    OnPhase0BlockAdded | OnAltairBlockAdded | OnBellatrixBlockAdded |
-    OnCapellaBlockAdded | OnDenebBlockAdded | OnElectraBlockAdded |
-    OnFuluBlockAdded
-
-  OnForkedBlockAdded* = proc(
-    blckRef: BlockRef, blck: ForkedTrustedSignedBeaconBlock, epochRef: EpochRef,
+  OnBlockAdded*[consensusFork: static ConsensusFork] = proc(
+    blckRef: BlockRef, blck: consensusFork.TrustedSignedBeaconBlock,
+    state: consensusFork.BeaconState, epochRef: EpochRef,
     unrealized: FinalityCheckpoints) {.gcsafe, raises: [].}
 
   OnStateUpdated* = proc(
@@ -319,7 +310,7 @@ type
     epoch_transition*: bool
     previous_duty_dependent_root*: Eth2Digest
     current_duty_dependent_root*: Eth2Digest
-    optimistic* {.serializedFieldName: "execution_optimistic".}: Option[bool]
+    optimistic* {.serializedFieldName: "execution_optimistic".}: Opt[bool]
 
   ReorgInfoObject* = object
     slot*: Slot
@@ -328,36 +319,25 @@ type
     new_head_block*: Eth2Digest
     old_head_state*: Eth2Digest
     new_head_state*: Eth2Digest
-    optimistic* {.serializedFieldName: "execution_optimistic".}: Option[bool]
+    optimistic* {.serializedFieldName: "execution_optimistic".}: Opt[bool]
 
   FinalizationInfoObject* = object
     block_root* {.serializedFieldName: "block".}: Eth2Digest
     state_root* {.serializedFieldName: "state".}: Eth2Digest
     epoch*: Epoch
-    optimistic* {.serializedFieldName: "execution_optimistic".}: Option[bool]
+    optimistic* {.serializedFieldName: "execution_optimistic".}: Opt[bool]
 
   EventBeaconBlockObject* = object
     slot*: Slot
     block_root* {.serializedFieldName: "block".}: Eth2Digest
-    optimistic* {.serializedFieldName: "execution_optimistic".}: Option[bool]
+    optimistic* {.serializedFieldName: "execution_optimistic".}: Opt[bool]
 
-template OnBlockAddedCallback*(kind: static ConsensusFork): auto =
-  when kind == ConsensusFork.Fulu:
-    typedesc[OnFuluBlockAdded]
-  elif kind == ConsensusFork.Electra:
-    typedesc[OnElectraBlockAdded]
-  elif kind == ConsensusFork.Deneb:
-    typedesc[OnDenebBlockAdded]
-  elif kind == ConsensusFork.Capella:
-    typedesc[OnCapellaBlockAdded]
-  elif kind == ConsensusFork.Bellatrix:
-    typedesc[OnBellatrixBlockAdded]
-  elif kind == ConsensusFork.Altair:
-    typedesc[OnAltairBlockAdded]
-  elif kind == ConsensusFork.Phase0:
-    typedesc[OnPhase0BlockAdded]
-  else:
-    static: raiseAssert "Unreachable"
+  EventBeaconBlockGossipObject* = object
+    slot*: Slot
+    block_root* {.serializedFieldName: "block".}: Eth2Digest
+
+template timeParams*(dag: ChainDAGRef): TimeParams =
+  dag.cfg.timeParams
 
 func proposer_dependent_slot*(epochRef: EpochRef): Slot =
   epochRef.key.epoch.proposer_dependent_slot()
@@ -389,6 +369,9 @@ func horizon*(dag: ChainDAGRef): Slot =
   else:
     GENESIS_SLOT
 
+func earliestAvailableSlot*(dag: ChainDAGRef): Slot =
+  dag.eaSlot
+
 template epoch*(e: EpochRef): Epoch = e.key.epoch
 
 func shortLog*(v: EpochKey): string =
@@ -400,6 +383,9 @@ template setFinalizationCb*(dag: ChainDAGRef, cb: OnFinalizedCallback) =
 
 template setBlockCb*(dag: ChainDAGRef, cb: OnBlockCallback) =
   dag.onBlockAdded = cb
+
+template setBlockGossipCb*(dag: ChainDAGRef, cb: OnBlockGossipCallback) =
+  dag.onBlockGossipAdded = cb
 
 template setHeadCb*(dag: ChainDAGRef, cb: OnHeadCallback) =
   dag.onHeadChanged = cb
@@ -469,10 +455,18 @@ func init*(t: typedesc[FinalizationInfoObject], blockRoot: Eth2Digest,
 
 func init*(t: typedesc[EventBeaconBlockObject],
            v: ForkedTrustedSignedBeaconBlock,
-           optimistic: Option[bool]): EventBeaconBlockObject =
+           optimistic: Opt[bool]): EventBeaconBlockObject =
   withBlck(v):
     EventBeaconBlockObject(
       slot: forkyBlck.message.slot,
       block_root: forkyBlck.root,
       optimistic: optimistic
+    )
+
+func init*(t: typedesc[EventBeaconBlockGossipObject],
+           v: ForkedSignedBeaconBlock): EventBeaconBlockGossipObject =
+  withBlck(v):
+    EventBeaconBlockGossipObject(
+      slot: forkyBlck.message.slot,
+      block_root: forkyBlck.root
     )

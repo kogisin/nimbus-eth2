@@ -5,13 +5,12 @@
 #   * Apache v2 license (license terms in the root directory or at https://www.apache.org/licenses/LICENSE-2.0).
 # at your option. This file may not be copied, modified, or distributed except according to those terms.
 
-{.push raises: [].}
+{.push raises: [], gcsafe.}
 {.used.}
 
 import
   # Beacon chain internals
-  ../beacon_chain/spec/helpers,
-  ../beacon_chain/spec/datatypes/[bellatrix, capella],
+  ../beacon_chain/spec/forks,
   ../beacon_chain/spec/mev/[bellatrix_mev, capella_mev, deneb_mev, electra_mev,
     fulu_mev],
   # Test utilities
@@ -52,14 +51,18 @@ template bellatrix_steps() =
   do_check
   check: b.message.body.proposer_slashings.add(default(ProposerSlashing))
   do_check
-  when false:
-    debugComment "both Electra attestations and attestation slashings need to be done iff Electra"
-    check:
-      b.message.body.attester_slashings.add(default(phase0.AttesterSlashing))
-    do_check
-    check: b.message.body.attestations.add(
-      phase0.Attestation(aggregation_bits: CommitteeValidatorsBits.init(1)))
-    do_check
+  check:
+    b.message.body.attester_slashings.setLen(
+      b.message.body.attester_slashings.len + 1)
+  do_check
+  check:
+    when typeof(b).kind >= ConsensusFork.Electra:
+      b.message.body.attestations.add(electra.Attestation(
+        aggregation_bits: ElectraCommitteeValidatorsBits.init(1)))
+    else:
+      b.message.body.attestations.add(phase0.Attestation(
+        aggregation_bits: CommitteeValidatorsBits.init(1)))
+  do_check
   check: b.message.body.deposits.add(default(Deposit))
   do_check
   check: b.message.body.voluntary_exits.add(default(SignedVoluntaryExit))
@@ -142,7 +145,8 @@ template fulu_steps() =
 
 suite "Blinded block conversions":
   withAll(ConsensusFork):
-    when consensusFork >= ConsensusFork.Bellatrix:
+    debugGloasComment "needs toSignedBlindedBeaconBlock"
+    when consensusFork >= ConsensusFork.Bellatrix and consensusFork != ConsensusFork.Gloas:
       test $consensusFork & " toSignedBlindedBeaconBlock":
         var b = default(consensusFork.SignedBeaconBlock)
         do_check
@@ -155,4 +159,5 @@ suite "Blinded block conversions":
           electra_steps
         when consensusFork >= ConsensusFork.Fulu:
           fulu_steps
-        static: doAssert high(ConsensusFork) == ConsensusFork.Fulu
+        debugGloasComment ""
+        static: doAssert high(ConsensusFork) == ConsensusFork.Gloas

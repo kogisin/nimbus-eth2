@@ -5,8 +5,9 @@
 #   * Apache v2 license (license terms in the root directory or at https://www.apache.org/licenses/LICENSE-2.0).
 # at your option. This file may not be copied, modified, or distributed except according to those terms.
 
-{.push raises: [].}
+{.push raises: [], gcsafe.}
 
+import std/algorithm, json, sequtils
 import stew/[byteutils, base10], chronicles
 import ".."/beacon_node,
        ".."/spec/forks,
@@ -16,15 +17,32 @@ export rest_utils
 
 logScope: topics = "rest_config"
 
+func cmpBPOconfig(x, y: BlobParameters): int =
+  cmp(x.EPOCH.distinctBase, y.EPOCH.distinctBase)
+
 proc installConfigApiHandlers*(router: var RestRouter, node: BeaconNode) =
   template cfg(): auto = node.dag.cfg
   let
     cachedForkSchedule =
       RestApiResponse.prepareJsonResponse(getForkSchedule(cfg))
+
+    # This has been intentionally copied and sorted in ascending order
+    # as the spec demands the endpoint to be sorted in this fashion.
+    # The spec says:
+    # There MUST NOT exist multiple blob schedule entries with the same epoch value.
+    # The maximum blobs per block limit for blob schedules entries MUST be less than
+    # or equal to `MAX_BLOB_COMMITMENTS_PER_BLOCK`. The blob schedule entries SHOULD
+    # be sorted by epoch in ascending order. The blob schedule MAY be empty.
+    sortedBlobSchedule = cfg.BLOB_SCHEDULE.sorted(cmp=cmpBPOconfig)
+    restBlobSchedule = sortedBlobSchedule.mapIt(%*{
+      "EPOCH": Base10.toString(uint64(it.EPOCH)),
+      "MAX_BLOBS_PER_BLOCK": Base10.toString(uint64(it.MAX_BLOBS_PER_BLOCK))
+    })
+
     cachedConfigSpec =
       RestApiResponse.prepareJsonResponse(
         (
-          # https://github.com/ethereum/consensus-specs/blob/v1.5.0-beta.3/presets/mainnet/phase0.yaml
+          # https://github.com/ethereum/consensus-specs/blob/v1.5.0-beta.5/presets/mainnet/phase0.yaml
           MAX_COMMITTEES_PER_SLOT:
             Base10.toString(MAX_COMMITTEES_PER_SLOT),
           TARGET_COMMITTEE_SIZE:
@@ -95,7 +113,7 @@ proc installConfigApiHandlers*(router: var RestRouter, node: BeaconNode) =
           MAX_VOLUNTARY_EXITS:
             Base10.toString(MAX_VOLUNTARY_EXITS),
 
-          # https://github.com/ethereum/consensus-specs/blob/v1.5.0-beta.3/presets/mainnet/altair.yaml
+          # https://github.com/ethereum/consensus-specs/blob/v1.5.0-beta.5/presets/mainnet/altair.yaml
           INACTIVITY_PENALTY_QUOTIENT_ALTAIR:
             Base10.toString(INACTIVITY_PENALTY_QUOTIENT_ALTAIR),
           MIN_SLASHING_PENALTY_QUOTIENT_ALTAIR:
@@ -113,7 +131,7 @@ proc installConfigApiHandlers*(router: var RestRouter, node: BeaconNode) =
           UPDATE_TIMEOUT:
             Base10.toString(UPDATE_TIMEOUT),
 
-          # https://github.com/ethereum/consensus-specs/blob/v1.5.0-beta.3/presets/mainnet/bellatrix.yaml
+          # https://github.com/ethereum/consensus-specs/blob/v1.5.0-beta.5/presets/mainnet/bellatrix.yaml
           INACTIVITY_PENALTY_QUOTIENT_BELLATRIX:
             Base10.toString(INACTIVITY_PENALTY_QUOTIENT_BELLATRIX),
           MIN_SLASHING_PENALTY_QUOTIENT_BELLATRIX:
@@ -130,7 +148,7 @@ proc installConfigApiHandlers*(router: var RestRouter, node: BeaconNode) =
           MAX_EXTRA_DATA_BYTES:
             Base10.toString(uint64(MAX_EXTRA_DATA_BYTES)),
 
-          # https://github.com/ethereum/consensus-specs/blob/v1.5.0-beta.3/presets/mainnet/capella.yaml
+          # https://github.com/ethereum/consensus-specs/blob/v1.5.0-beta.5/presets/mainnet/capella.yaml
           MAX_BLS_TO_EXECUTION_CHANGES:
             Base10.toString(uint64(MAX_BLS_TO_EXECUTION_CHANGES)),
           MAX_WITHDRAWALS_PER_PAYLOAD:
@@ -138,7 +156,7 @@ proc installConfigApiHandlers*(router: var RestRouter, node: BeaconNode) =
           MAX_VALIDATORS_PER_WITHDRAWALS_SWEEP:
             Base10.toString(uint64(MAX_VALIDATORS_PER_WITHDRAWALS_SWEEP)),
 
-          # https://github.com/ethereum/consensus-specs/blob/v1.5.0-beta.3/presets/mainnet/deneb.yaml
+          # https://github.com/ethereum/consensus-specs/blob/v1.5.0-beta.5/presets/mainnet/deneb.yaml
           FIELD_ELEMENTS_PER_BLOB:
             Base10.toString(deneb_preset.FIELD_ELEMENTS_PER_BLOB),
           MAX_BLOB_COMMITMENTS_PER_BLOCK:
@@ -194,7 +212,9 @@ proc installConfigApiHandlers*(router: var RestRouter, node: BeaconNode) =
             Base10.toString(uint64(cfg.FULU_FORK_EPOCH)),
 
           SECONDS_PER_SLOT:
-            Base10.toString(SECONDS_PER_SLOT),
+            Base10.toString(uint64(cfg.timeParams.SLOT_DURATION.seconds)),
+          SLOT_DURATION_MS:
+            Base10.toString(uint64(cfg.timeParams.SLOT_DURATION.milliseconds)),
           SECONDS_PER_ETH1_BLOCK:
             Base10.toString(cfg.SECONDS_PER_ETH1_BLOCK),
           MIN_VALIDATOR_WITHDRAWABILITY_DELAY:
@@ -220,11 +240,11 @@ proc installConfigApiHandlers*(router: var RestRouter, node: BeaconNode) =
           PROPOSER_SCORE_BOOST:
             Base10.toString(PROPOSER_SCORE_BOOST),
           REORG_HEAD_WEIGHT_THRESHOLD:
-            Base10.toString(REORG_HEAD_WEIGHT_THRESHOLD),
+            Base10.toString(cfg.REORG_HEAD_WEIGHT_THRESHOLD),
           REORG_PARENT_WEIGHT_THRESHOLD:
             Base10.toString(REORG_PARENT_WEIGHT_THRESHOLD),
           REORG_MAX_EPOCHS_SINCE_FINALIZATION:
-            Base10.toString(uint64(REORG_MAX_EPOCHS_SINCE_FINALIZATION)),
+            Base10.toString(cfg.REORG_MAX_EPOCHS_SINCE_FINALIZATION),
 
           DEPOSIT_CHAIN_ID:
             Base10.toString(cfg.DEPOSIT_CHAIN_ID),
@@ -241,10 +261,6 @@ proc installConfigApiHandlers*(router: var RestRouter, node: BeaconNode) =
             Base10.toString(EPOCHS_PER_SUBNET_SUBSCRIPTION),
           MIN_EPOCHS_FOR_BLOCK_REQUESTS:
             Base10.toString(cfg.MIN_EPOCHS_FOR_BLOCK_REQUESTS),
-          TTFB_TIMEOUT:
-            Base10.toString(TTFB_TIMEOUT),
-          RESP_TIMEOUT:
-            Base10.toString(RESP_TIMEOUT),
           ATTESTATION_PROPAGATION_SLOT_RANGE:
             Base10.toString(ATTESTATION_PROPAGATION_SLOT_RANGE),
           MAXIMUM_GOSSIP_CLOCK_DISPARITY:
@@ -285,26 +301,25 @@ proc installConfigApiHandlers*(router: var RestRouter, node: BeaconNode) =
             Base10.toString(cfg.MAX_REQUEST_BLOB_SIDECARS_ELECTRA),
 
           NUMBER_OF_COLUMNS:
-            Base10.toString(NUMBER_OF_COLUMNS.uint64),
+            Base10.toString(cfg.NUMBER_OF_COLUMNS.uint64),
           NUMBER_OF_CUSTODY_GROUPS:
-            Base10.toString(NUMBER_OF_CUSTODY_GROUPS.uint64),
+            Base10.toString(cfg.NUMBER_OF_CUSTODY_GROUPS.uint64),
           DATA_COLUMN_SIDECAR_SUBNET_COUNT:
-            Base10.toString(DATA_COLUMN_SIDECAR_SUBNET_COUNT.uint64),
+            Base10.toString(cfg.DATA_COLUMN_SIDECAR_SUBNET_COUNT.uint64),
           MAX_REQUEST_DATA_COLUMN_SIDECARS:
-            Base10.toString(MAX_REQUEST_DATA_COLUMN_SIDECARS),
+            Base10.toString(cfg.MAX_REQUEST_DATA_COLUMN_SIDECARS),
           SAMPLES_PER_SLOT:
-            Base10.toString(SAMPLES_PER_SLOT.uint64),
+            Base10.toString(cfg.SAMPLES_PER_SLOT.uint64),
           CUSTODY_REQUIREMENT:
-            Base10.toString(CUSTODY_REQUIREMENT.uint64),
+            Base10.toString(cfg.CUSTODY_REQUIREMENT.uint64),
           VALIDATOR_CUSTODY_REQUIREMENT:
-            Base10.toString(VALIDATOR_CUSTODY_REQUIREMENT.uint64),
+            Base10.toString(cfg.VALIDATOR_CUSTODY_REQUIREMENT.uint64),
           BALANCE_PER_ADDITIONAL_CUSTODY_GROUP:
-            Base10.toString(BALANCE_PER_ADDITIONAL_CUSTODY_GROUP),
-          # MAX_BLOBS_PER_BLOCK_FULU:
-          #   Base10.toString(cfg.MAX_BLOBS_PER_BLOCK_FULU),
-          # MIN_EPOCHS_FOR_DATA_COLUMN_SIDECARS_REQUESTS:
-          #   Base10.toString(cfg.MIN_EPOCHS_FOR_DATA_COLUMN_SIDECARS_REQUESTS),
-
+            Base10.toString(cfg.BALANCE_PER_ADDITIONAL_CUSTODY_GROUP.uint64),
+          BLOB_SCHEDULE:
+            restBlobSchedule,
+          MIN_EPOCHS_FOR_DATA_COLUMN_SIDECARS_REQUESTS:
+            Base10.toString(cfg.MIN_EPOCHS_FOR_DATA_COLUMN_SIDECARS_REQUESTS.uint64),
           # https://github.com/ethereum/consensus-specs/blob/v1.4.0-alpha.3/specs/phase0/beacon-chain.md#constants
           # GENESIS_SLOT
           # GENESIS_EPOCH
@@ -409,7 +424,7 @@ proc installConfigApiHandlers*(router: var RestRouter, node: BeaconNode) =
           MAX_WITHDRAWAL_REQUESTS_PER_PAYLOAD:
             Base10.toString(uint64(MAX_WITHDRAWAL_REQUESTS_PER_PAYLOAD)),
           MAX_CONSOLIDATION_REQUESTS_PER_PAYLOAD:
-            Base10.toString(MAX_CONSOLIDATION_REQUESTS_PER_PAYLOAD),
+            Base10.toString(uint64(MAX_CONSOLIDATION_REQUESTS_PER_PAYLOAD)),
           MAX_PENDING_PARTIALS_PER_WITHDRAWALS_SWEEP:
             Base10.toString(uint64(MAX_PENDING_PARTIALS_PER_WITHDRAWALS_SWEEP)),
           MAX_PENDING_DEPOSITS_PER_EPOCH:

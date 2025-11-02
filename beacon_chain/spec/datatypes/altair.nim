@@ -5,7 +5,7 @@
 #   * Apache v2 license (license terms in the root directory or at https://www.apache.org/licenses/LICENSE-2.0).
 # at your option. This file may not be copied, modified, or distributed except according to those terms.
 
-{.push raises: [].}
+{.push raises: [], gcsafe.}
 
 # Types specific to altair (i.e. known to have changed across hard forks) - see
 # `base` for types and guidelines common across forks
@@ -34,13 +34,13 @@ type
 
 static:
   # Verify that ordinals follow spec values (the spec uses these as shifts for bit flags)
-  # https://github.com/ethereum/consensus-specs/blob/v1.5.0-alpha.9/specs/altair/beacon-chain.md#participation-flag-indices
+  # https://github.com/ethereum/consensus-specs/blob/v1.5.0-beta.4/specs/altair/beacon-chain.md#participation-flag-indices
   doAssert ord(TIMELY_SOURCE_FLAG_INDEX) == 0
   doAssert ord(TIMELY_TARGET_FLAG_INDEX) == 1
   doAssert ord(TIMELY_HEAD_FLAG_INDEX) == 2
 
 const
-  # https://github.com/ethereum/consensus-specs/blob/v1.5.0-beta.3/specs/altair/beacon-chain.md#incentivization-weights
+  # https://github.com/ethereum/consensus-specs/blob/v1.5.0-beta.4/specs/altair/beacon-chain.md#incentivization-weights
   TIMELY_SOURCE_WEIGHT* = 14
   TIMELY_TARGET_WEIGHT* = 26
   TIMELY_HEAD_WEIGHT* = 14
@@ -60,7 +60,7 @@ const
   # The first member (`genesis_time`) is 32, subsequent members +1 each.
   # If there are ever more than 32 members in `BeaconState`, indices change!
   # `FINALIZED_ROOT_GINDEX` is one layer deeper, i.e., `52 * 2 + 1`.
-  # https://github.com/ethereum/consensus-specs/blob/v1.5.0-alpha.3/ssz/merkle-proofs.md
+  # https://github.com/ethereum/consensus-specs/blob/v1.6.0-alpha.0/ssz/merkle-proofs.md
   # finalized_checkpoint > root
   FINALIZED_ROOT_GINDEX* = 105.GeneralizedIndex
   # current_sync_committee
@@ -96,12 +96,12 @@ type
     sync_committee_bits*: BitArray[SYNC_COMMITTEE_SIZE]
     sync_committee_signature*: TrustedSig
 
-  # https://github.com/ethereum/consensus-specs/blob/v1.5.0-beta.3/specs/altair/beacon-chain.md#synccommittee
+  # https://github.com/ethereum/consensus-specs/blob/v1.5.0-beta.4/specs/altair/beacon-chain.md#synccommittee
   SyncCommittee* = object
     pubkeys*: HashArray[Limit SYNC_COMMITTEE_SIZE, ValidatorPubKey]
     aggregate_pubkey*: ValidatorPubKey
 
-  # https://github.com/ethereum/consensus-specs/blob/v1.5.0-alpha.10/specs/altair/validator.md#synccommitteemessage
+  # https://github.com/ethereum/consensus-specs/blob/v1.5.0-beta.4/specs/altair/validator.md#synccommitteemessage
   SyncCommitteeMessage* = object
     slot*: Slot
       ## Slot to which this contribution pertains
@@ -197,7 +197,7 @@ type
     signature_slot*: Slot
       ## Slot at which the aggregate signature was created (untrusted)
 
-  # https://github.com/ethereum/consensus-specs/blob/v1.4.0-beta.5/specs/altair/light-client/sync-protocol.md#lightclientfinalityupdate
+  # https://github.com/ethereum/consensus-specs/blob/v1.5.0-beta.4/specs/altair/light-client/sync-protocol.md#lightclientfinalityupdate
   LightClientFinalityUpdate* = object
     # Header attested to by the sync committee
     attested_header*: LightClientHeader
@@ -403,7 +403,7 @@ type
     state_root*: Eth2Digest
     body*: TrustedBeaconBlockBody
 
-  # https://github.com/ethereum/consensus-specs/blob/v1.4.0/specs/altair/beacon-chain.md#beaconblockbody
+  # https://github.com/ethereum/consensus-specs/blob/v1.5.0-beta.4/specs/altair/beacon-chain.md#beaconblockbody
   BeaconBlockBody* = object
     randao_reveal*: ValidatorSig
     eth1_data*: Eth1Data
@@ -455,7 +455,7 @@ type
 
   SyncnetBits* = BitArray[SYNC_COMMITTEE_SUBNET_COUNT]
 
-  # https://github.com/ethereum/consensus-specs/blob/v1.4.0/specs/altair/p2p-interface.md#metadata
+  # https://github.com/ethereum/consensus-specs/blob/v1.6.0-alpha.0/specs/altair/p2p-interface.md#metadata
   MetaData* = object
     seq_number*: uint64
     attnets*: AttnetBits
@@ -506,12 +506,6 @@ type
 
     root* {.dontSerialize.}: Eth2Digest # cached root of signed beacon block
 
-  MsgTrustedSignedBeaconBlock* = object
-    message*: TrustedBeaconBlock
-    signature*: ValidatorSig
-
-    root* {.dontSerialize.}: Eth2Digest # cached root of signed beacon block
-
   TrustedSignedBeaconBlock* = object
     message*: TrustedBeaconBlock
     signature*: TrustedSig
@@ -521,7 +515,6 @@ type
   SomeSignedBeaconBlock* =
     SignedBeaconBlock |
     SigVerifiedSignedBeaconBlock |
-    MsgTrustedSignedBeaconBlock |
     TrustedSignedBeaconBlock
   SomeBeaconBlock* =
     BeaconBlock |
@@ -719,13 +712,11 @@ func clear*(info: var EpochInfo) =
 
 template asSigned*(
     x: SigVerifiedSignedBeaconBlock |
-       MsgTrustedSignedBeaconBlock |
        TrustedSignedBeaconBlock): SignedBeaconBlock =
   isomorphicCast[SignedBeaconBlock](x)
 
 template asSigVerified*(
     x: SignedBeaconBlock |
-       MsgTrustedSignedBeaconBlock |
        TrustedSignedBeaconBlock): SigVerifiedSignedBeaconBlock =
   isomorphicCast[SigVerifiedSignedBeaconBlock](x)
 
@@ -733,16 +724,9 @@ template asSigVerified*(
     x: BeaconBlock | TrustedBeaconBlock): SigVerifiedBeaconBlock =
   isomorphicCast[SigVerifiedBeaconBlock](x)
 
-template asMsgTrusted*(
-    x: SignedBeaconBlock |
-       SigVerifiedSignedBeaconBlock |
-       TrustedSignedBeaconBlock): MsgTrustedSignedBeaconBlock =
-  isomorphicCast[MsgTrustedSignedBeaconBlock](x)
-
 template asTrusted*(
     x: SignedBeaconBlock |
-       SigVerifiedSignedBeaconBlock |
-       MsgTrustedSignedBeaconBlock): TrustedSignedBeaconBlock =
+       SigVerifiedSignedBeaconBlock): TrustedSignedBeaconBlock =
   isomorphicCast[TrustedSignedBeaconBlock](x)
 
 template asTrusted*(

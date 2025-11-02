@@ -5,21 +5,20 @@
 #   * Apache v2 license (license terms in the root directory or at http://www.apache.org/licenses/LICENSE-2.0).
 # at your option. This file may not be copied, modified, or distributed except according to those terms.
 
-{.push raises: [].}
+{.push raises: [], gcsafe.}
 
 import
   # Status
   chronicles, chronos, metrics,
   results,
   kzg4844/[kzg, kzg_abi],
-  stew/byteutils,
   # Internals
   ../spec/[
     beaconstate, state_transition_block, forks,
     helpers, network, signatures, peerdas_helpers],
   ../consensus_object_pools/[
-    attestation_pool, blockchain_dag, blob_quarantine, block_quarantine,
-    data_column_quarantine, spec_cache, light_client_pool, sync_committee_msg_pool,
+    attestation_pool, blockchain_dag, blob_quarantine, block_clearance,
+    block_quarantine, spec_cache, light_client_pool, sync_committee_msg_pool,
     validator_change_pool],
   ".."/[beacon_clock],
   ./batch_validation
@@ -52,7 +51,7 @@ type
 template errIgnore*(msg: cstring): untyped =
   err((ValidationResult.Ignore, cstring msg))
 template errReject*(msg: cstring): untyped =
-  err((ValidationResult.Reject, cstring msg))
+  err((ValidationResult.Reject, msg))
 
 # Internal checks
 # ----------------------------------------------------------------
@@ -82,20 +81,22 @@ func check_attestation_block(
   ok()
 
 func check_propagation_slot_range(
-    consensusFork: ConsensusFork, msgSlot: Slot, wallTime: BeaconTime):
-    Result[Slot, ValidationError] =
-  let futureSlot = (wallTime + MAXIMUM_GOSSIP_CLOCK_DISPARITY).toSlot()
-
+    timeParams: TimeParams,
+    consensusFork: ConsensusFork,
+    msgSlot: Slot,
+    wallTime: BeaconTime): Result[Slot, ValidationError] =
+  let futureSlot =
+    (wallTime + MAXIMUM_GOSSIP_CLOCK_DISPARITY).toSlot(timeParams)
   if not futureSlot.afterGenesis or msgSlot > futureSlot.slot:
     return errIgnore("Attestation slot in the future")
 
-  let pastSlot = (wallTime - MAXIMUM_GOSSIP_CLOCK_DISPARITY).toSlot()
-
+  let pastSlot =
+    (wallTime - MAXIMUM_GOSSIP_CLOCK_DISPARITY).toSlot(timeParams)
   if not pastSlot.afterGenesis:
     return ok(msgSlot)
 
   if consensusFork < ConsensusFork.Deneb:
-    # https://github.com/ethereum/consensus-specs/blob/v1.5.0-alpha.8/specs/phase0/p2p-interface.md#configuration
+    # https://github.com/ethereum/consensus-specs/blob/v1.5.0-beta.4/specs/phase0/p2p-interface.md#configuration
     # The spec value of ATTESTATION_PROPAGATION_SLOT_RANGE is 32, but it can
     # retransmit attestations on the cusp of being out of spec, and which by
     # the time they reach their destination might be out of spec.
@@ -105,7 +106,7 @@ func check_propagation_slot_range(
         pastSlot.slot:
       return errIgnore("Attestation slot in the past")
   else:
-    # https://github.com/ethereum/consensus-specs/blob/v1.4.0-beta.2/specs/deneb/p2p-interface.md#beacon_attestation_subnet_id
+    # https://github.com/ethereum/consensus-specs/blob/v1.6.0-alpha.0/specs/deneb/p2p-interface.md#beacon_attestation_subnet_id
     # "[IGNORE] the epoch of attestation.data.slot is either the current or
     # previous epoch (with a MAXIMUM_GOSSIP_CLOCK_DISPARITY allowance) -- i.e.
     # compute_epoch_at_slot(attestation.data.slot) in
@@ -121,21 +122,23 @@ func check_propagation_slot_range(
 
   ok(msgSlot)
 
-func check_slot_exact(msgSlot: Slot, wallTime: BeaconTime):
-    Result[Slot, ValidationError] =
-  let futureSlot = (wallTime + MAXIMUM_GOSSIP_CLOCK_DISPARITY).toSlot()
-
+func check_slot_exact(
+    timeParams: TimeParams,
+    msgSlot: Slot,
+    wallTime: BeaconTime): Result[Slot, ValidationError] =
+  let futureSlot =
+    (wallTime + MAXIMUM_GOSSIP_CLOCK_DISPARITY).toSlot(timeParams)
   if not futureSlot.afterGenesis or msgSlot > futureSlot.slot:
     return errIgnore("Sync committee slot in the future")
 
-  let pastSlot = (wallTime - MAXIMUM_GOSSIP_CLOCK_DISPARITY).toSlot()
-
+  let pastSlot =
+    (wallTime - MAXIMUM_GOSSIP_CLOCK_DISPARITY).toSlot(timeParams)
   if pastSlot.afterGenesis and msgSlot < pastSlot.slot:
     return errIgnore("Sync committee slot in the past")
 
   ok(msgSlot)
 
-func check_beacon_and_target_block(
+proc check_beacon_and_target_block(
     pool: var AttestationPool, data: AttestationData):
     Result[BlockSlot, ValidationError] =
   # The block being voted for (data.beacon_block_root) passes validation - by
@@ -206,12 +209,12 @@ func check_blob_sidecar_inclusion_proof(
     blob_sidecar: deneb.BlobSidecar): Result[void, ValidationError] =
   let res = blob_sidecar.verify_blob_sidecar_inclusion_proof()
   if res.isErr:
-    return errReject(res.error)
+    return errReject(cstring res.error)
 
   ok()
 
 func check_data_column_sidecar_inclusion_proof(
-  data_column_sidecar: DataColumnSidecar): Result[void, ValidationError] =
+    data_column_sidecar: fulu.DataColumnSidecar): Result[void, ValidationError] =
   let res = data_column_sidecar.verify_data_column_sidecar_inclusion_proof()
   if res.isErr:
     return errReject(res.error)
@@ -219,7 +222,8 @@ func check_data_column_sidecar_inclusion_proof(
   ok()
 
 proc check_data_column_sidecar_kzg_proofs(
-  data_column_sidecar: DataColumnSidecar): Result[void, ValidationError] =
+    data_column_sidecar: fulu.DataColumnSidecar | gloas.DataColumnSidecar):
+    Result[void, ValidationError] =
   let res = data_column_sidecar.verify_data_column_sidecar_kzg_proofs()
   if res.isErr:
     return errReject(res.error)
@@ -294,17 +298,22 @@ template checkedReject(
   pool.dag.checkedReject(error)
 
 func getMaxBlobsPerBlock(cfg: RuntimeConfig, slot: Slot): uint64 =
-  if slot >= cfg.ELECTRA_FORK_EPOCH.start_slot:
+  let epoch = slot.epoch
+  if epoch >= cfg.FULU_FORK_EPOCH:
+    get_blob_parameters(cfg, epoch).MAX_BLOBS_PER_BLOCK
+  elif epoch >= cfg.ELECTRA_FORK_EPOCH:
     cfg.MAX_BLOBS_PER_BLOCK_ELECTRA
   else:
     cfg.MAX_BLOBS_PER_BLOCK
 
+debugGloasComment ""
+# https://github.com/ethereum/consensus-specs/blob/v1.6.0-beta.0/specs/gloas/p2p-interface.md#beacon_block
 template validateBeaconBlockBellatrix(
-    _: phase0.SignedBeaconBlock | altair.SignedBeaconBlock,
+    _: phase0.SignedBeaconBlock | altair.SignedBeaconBlock | gloas.SignedBeaconBlock,
     _: BlockRef): untyped =
   discard
 
-# https://github.com/ethereum/consensus-specs/blob/v1.3.0/specs/bellatrix/p2p-interface.md#beacon_block
+# https://github.com/ethereum/consensus-specs/blob/v1.6.0-alpha.2/specs/bellatrix/p2p-interface.md#beacon_block
 template validateBeaconBlockBellatrix(
     signed_beacon_block:
       bellatrix.SignedBeaconBlock | capella.SignedBeaconBlock |
@@ -343,7 +352,7 @@ template validateBeaconBlockBellatrix(
     # compute_timestamp_at_slot(state, block.slot).
     let timestampAtSlot =
       withState(dag.headState):
-        compute_timestamp_at_slot(
+        dag.timeParams.compute_timestamp_at_slot(
           forkyState.data, signed_beacon_block.message.slot)
     if not (signed_beacon_block.message.body.execution_payload.timestamp ==
         timestampAtSlot):
@@ -358,11 +367,13 @@ template validateBeaconBlockBellatrix(
   # cannot occur here, because Nimbus's optimistic sync waits for either
   # `ACCEPTED` or `SYNCING` from the EL to get this far.
 
+debugGloasComment ""
+# https://github.com/ethereum/consensus-specs/blob/v1.6.0-beta.0/specs/gloas/p2p-interface.md#beacon_block
 template validateBeaconBlockDeneb(
     _: ChainDAGRef,
     _:
       phase0.SignedBeaconBlock | altair.SignedBeaconBlock |
-      bellatrix.SignedBeaconBlock | capella.SignedBeaconBlock,
+      bellatrix.SignedBeaconBlock | capella.SignedBeaconBlock | gloas.SignedBeaconBlock,
     _: BeaconTime): untyped =
   discard
 
@@ -377,8 +388,10 @@ template validateBeaconBlockDeneb(
   # [REJECT] The length of KZG commitments is less than or equal to the
   # limitation defined in Consensus Layer -- i.e. validate that
   # len(body.signed_beacon_block.message.blob_kzg_commitments) <= MAX_BLOBS_PER_BLOCK
+  let blob_params =
+    dag.cfg.get_blob_parameters(signed_beacon_block.message.slot.epoch())
   if not (lenu64(signed_beacon_block.message.body.blob_kzg_commitments) <=
-      dag.cfg.getMaxBlobsPerBlock(signed_beacon_block.message.slot)):
+      blob_params.MAX_BLOBS_PER_BLOCK):
     return dag.checkedReject("validateBeaconBlockDeneb: too many blob commitments")
 
 # https://github.com/ethereum/consensus-specs/blob/v1.4.0-beta.4/specs/deneb/p2p-interface.md#blob_sidecar_subnet_id
@@ -408,7 +421,7 @@ proc validateBlobSidecar*(
   # `block_header.slot <= current_slot` (a client MAY queue future sidecars
   # for processing at the appropriate slot).
   if not (block_header.slot <=
-      (wallTime + MAXIMUM_GOSSIP_CLOCK_DISPARITY).slotOrZero):
+      (wallTime + MAXIMUM_GOSSIP_CLOCK_DISPARITY).slotOrZero(dag.timeParams)):
     return errIgnore("BlobSidecar: slot too high")
 
   # [IGNORE] The sidecar is from a slot greater than the latest
@@ -424,7 +437,7 @@ proc validateBlobSidecar*(
   if dag.getBlockRef(block_root).isSome():
     return errIgnore("BlobSidecar: already have block")
 
-  # This adds KZG commitment matching to the spec gossip validation. It's an
+  # This adds block root matching to the spec gossip validation. It's an
   # IGNORE condition, so it shouldn't affect Nimbus's scoring, and when some
   # (slashable) double proposals happen with blobs present, without this one
   # or the other block, or potentially both, won't get its full set of blobs
@@ -434,9 +447,51 @@ proc validateBlobSidecar*(
   #
   # It would be good to fix this more properly, but this has come up often on
   # Pectra devnet-6.
-  if blobQuarantine[].hasBlob(
-      block_header.slot, block_header.proposer_index, blob_sidecar.index,
-      blob_sidecar.kzg_commitment):
+  #
+  # Detailed explanation:
+  #
+  # There were regular double-proposer, slashable events (some of which got
+  # slashed, but that takes at least a couple of slots typically to be noticed,
+  # it's not instant). What would happen is, Nimbus would be going fine,
+  # following the chain, until one of these double proposals came up.
+  # Each had, independently, some set of blobs:
+  #
+  # * separately valid block 1, with a set of valid blobs; and
+  # * separately valid block 2, with a set of valid blobs (different than the
+  #   first set, created by a different node).
+  #
+  # Both of these proposals shared a slot and proposer index, because they were
+  # the same proposer. Indeed, the signatures were all valid too, because, well,
+  # they were both legitimately running that private key.
+  #
+  # But what would happen is,
+  #   * if block 1's blobs came in, and block 1 came in, and block 1 turned out
+  #     to be the one the chain followed, then, great, the IGNORE condition here
+  #     worked fine (WLOG extend to block 2); but
+  #   * if the blobs came in interleaved, this wasn't always true, and,
+  #     crucially, this gossip condition as spec-written prevented Nimbus's
+  #     gossip from being able to collect all the blobs from block 1.
+  #
+  # Maybe other clients did/do this by having a very efficient
+  # request manager-equivalent, I'm not sure. But without something, either
+  # receiving via gossip or req/resp, Nimbus just got stuck until a suitable
+  # reorg happened, typically dozens of slots later, because this gossip
+  # condition prevented it from seeing all the blobs corresponding to either
+  # block.
+  #
+  # Also, it would be basically random chance which, if asked by req/resp,
+  # of the two different (or more, but the devnet-6 case was two slashable
+  # blocks at a time) sets of blobs would be returned, so it seemed to
+  # sometimes have to retry this. All of this took enough time Nimbus lost the
+  # chain basically deterministically every time this slashable double-proposal
+  # situation came up.
+  #
+  # I don't see anything obviously corresponding to this in the tests, either,
+  # to show this is otherwise addressed.
+
+  if blobQuarantine[].hasSidecar(block_root, block_header.slot,
+                                 block_header.proposer_index,
+                                 blob_sidecar.index):
     return errIgnore("BlobSidecar: already have valid blob from same proposer")
 
   # [REJECT] The sidecar's inclusion proof is valid as verified by
@@ -455,11 +510,13 @@ proc validateBlobSidecar*(
   # `block_header.parent_root`) passes validation.
   let parent = dag.getBlockRef(block_header.parent_root).valueOr:
     if block_header.parent_root in quarantine[].unviable:
+      # If the parent was unviable, this block is unviable for the same reason
       quarantine[].addUnviable(block_root)
-      return dag.checkedReject("BlobSidecar: parent not validated")
-    else:
-      quarantine[].addMissing(block_header.parent_root)
-      return errIgnore("BlobSidecar: parent not found")
+      # TODO keep track of unviable invalid
+      return errIgnore("BlobSidecar: parent from unviable fork")
+
+    quarantine[].addMissing(block_header.parent_root)
+    return errIgnore("BlobSidecar: parent not found")
 
   # [REJECT] The sidecar is from a higher slot than the sidecar's
   # block's parent (defined by `block_header.parent_root`).
@@ -492,23 +549,13 @@ proc validateBlobSidecar*(
   # shuffling, the sidecar MAY be queued for later processing while proposers
   # for the block's branch are calculated -- in such a case do not
   # REJECT, instead IGNORE this message.
-  let proposer = getProposer(dag, parent, block_header.slot).valueOr:
-    warn "cannot compute proposer for blob"
-    return errIgnore("BlobSidecar: Cannot compute proposer") # internal issue
-
-  if uint64(proposer) != block_header.proposer_index:
-    return dag.checkedReject("BlobSidecar: Unexpected proposer")
-
   # [REJECT] The proposer signature of `blob_sidecar.signed_block_header`,
   # is valid with respect to the `block_header.proposer_index` pubkey.
-  if not verify_block_signature(
-      dag.forkAtEpoch(block_header.slot.epoch),
-      getStateField(dag.headState, genesis_validators_root),
-      block_header.slot,
-      block_root,
-      dag.validatorKey(proposer).get(),
-      blob_sidecar.signed_block_header.signature):
-    return dag.checkedReject("BlobSidecar: Invalid proposer signature")
+  dag.verifyBlockProposer(
+    parent, block_header.slot, block_header.proposer_index, block_root,
+    blob_sidecar.signed_block_header.signature,
+  ).isOkOr:
+    return dag.checkedReject(error.msg)
 
   # [REJECT] The sidecar's blob is valid as verified by `verify_blob_kzg_proof(
   # blob_sidecar.blob, blob_sidecar.kzg_commitment, blob_sidecar.kzg_proof)`.
@@ -522,9 +569,10 @@ proc validateBlobSidecar*(
       return dag.checkedReject("BlobSidecar: blob invalid")
 
   # Send notification about new blob sidecar via callback
-  if not(isNil(blobQuarantine.onBlobSidecarCallback)):
-    blobQuarantine.onBlobSidecarCallback BlobSidecarInfoObject(
-      block_root: hash_tree_root(blob_sidecar.signed_block_header.message),
+  let onBlobSidecarCallback = blobQuarantine[].onBlobSidecarCallback()
+  if not(isNil(onBlobSidecarCallback)):
+    onBlobSidecarCallback BlobSidecarInfoObject(
+      block_root: block_root,
       index: blob_sidecar.index,
       slot: blob_sidecar.signed_block_header.message.slot,
       kzg_commitment: blob_sidecar.kzg_commitment,
@@ -533,20 +581,20 @@ proc validateBlobSidecar*(
 
   ok()
 
-# https://github.com/ethereum/consensus-specs/blob/v1.5.0-alpha.10/specs/fulu/p2p-interface.md#data_column_sidecar_subnet_id
+# https://github.com/ethereum/consensus-specs/blob/v1.6.0-alpha.3/specs/fulu/p2p-interface.md#data_column_sidecar_subnet_id
 proc validateDataColumnSidecar*(
     dag: ChainDAGRef, quarantine: ref Quarantine,
-    dataColumnQuarantine: ref DataColumnQuarantine,
-    data_column_sidecar: DataColumnSidecar,
+    dataColumnQuarantine: ref ColumnQuarantine,
+    data_column_sidecar: fulu.DataColumnSidecar,
     wallTime: BeaconTime, subnet_id: uint64):
     Result[void, ValidationError] =
 
   template block_header: untyped = data_column_sidecar.signed_block_header.message
-
-  # [REJECT] The sidecar's index is consistent with `NUMBER_OF_COLUMNS`
-  # -- i.e. `data_column_sidecar.index < NUMBER_OF_COLUMNS`
-  if not (data_column_sidecar.index < NUMBER_OF_COLUMNS):
-    return dag.checkedReject("DataColumnSidecar: The sidecar's index should be consistent with NUMBER_OF_COLUMNS")
+  # [REJECT] The sidecar is valid as verified by verify_data_column_sidecar(sidecar)
+  block:
+    let v = verify_data_column_sidecar(dag.cfg, data_column_sidecar)
+    if v.isErr:
+      return dag.checkedReject(v.error)
 
   # [REJECT] The sidecar is for the correct subnet
   # -- i.e. `compute_subnet_for_data_column_sidecar(blob_sidecar.index) == subnet_id`.
@@ -558,7 +606,7 @@ proc validateDataColumnSidecar*(
   # `block_header.slot <= current_slot`(a client MAY queue future sidecars for
   # processing at the appropriate slot).
   if not (block_header.slot <=
-      (wallTime + MAXIMUM_GOSSIP_CLOCK_DISPARITY).slotOrZero):
+      (wallTime + MAXIMUM_GOSSIP_CLOCK_DISPARITY).slotOrZero(dag.timeParams)):
     return errIgnore("DataColumnSidecar: slot too high")
 
   # [IGNORE] The sidecar is from a slot greater than the latest
@@ -571,10 +619,8 @@ proc validateDataColumnSidecar*(
   # (block_header.slot, block_header.proposer_index, data_column_sidecar.index)
   # with valid header signature, sidecar inclusion proof, and kzg proof.
   let block_root = hash_tree_root(block_header)
-  if dag.getBlockRef(block_root).isSome():
-    return errIgnore("DataColumnSidecar: already have block")
-  if dataColumnQuarantine[].hasDataColumn(
-      block_header.slot, block_header.proposer_index, data_column_sidecar.index):
+  if dataColumnQuarantine[].hasSidecar(
+      block_root, block_header.slot, block_header.proposer_index, data_column_sidecar.index):
     return errIgnore("DataColumnSidecar: already have valid data column from same proposer")
 
   # [REJECT] The sidecar's `kzg_commitments` inclusion proof is valid as verified by
@@ -593,11 +639,13 @@ proc validateDataColumnSidecar*(
   # `block_header.parent_root`) passes validation.
   let parent = dag.getBlockRef(block_header.parent_root).valueOr:
     if block_header.parent_root in quarantine[].unviable:
+      # If the parent was unviable, this block is unviable for the same reason
       quarantine[].addUnviable(block_root)
-      return dag.checkedReject("DataColumnSidecar: parent not validated")
-    else:
-      quarantine[].addMissing(block_header.parent_root)
-      return errIgnore("DataColumnSidecar: parent not found")
+      # TODO keep track of unviable invalid
+      return errIgnore("DataColumnSidecar: parent from unviable fork")
+
+    quarantine[].addMissing(block_header.parent_root)
+    return errIgnore("DataColumnSidecar: parent not found")
 
   # [REJECT] The sidecar is from a higher slot than the sidecar's
   # block's parent (defined by `block_header.parent_root`).
@@ -630,23 +678,14 @@ proc validateDataColumnSidecar*(
   # shuffling, the sidecar MAY be queued for later processing while proposers
   # for the block's branch are calculated -- in such a case do not
   # REJECT, instead IGNORE this message.
-  let proposer = getProposer(dag, parent, block_header.slot).valueOr:
-    warn "cannot compute proposer for data column"
-    return errIgnore("DataColumnSidecar: Cannot compute proposer") # internal issue
-
-  if uint64(proposer) != block_header.proposer_index:
-    return dag.checkedReject("DataColumnSidecar: Unexpected proposer")
-
   # [REJECT] The proposer signature of `data_column_sidecar.signed_block_header`,
   # is valid with respect to the `block_header.proposer_index` pubkey.
-  if not verify_block_signature(
-      dag.forkAtEpoch(block_header.slot.epoch),
-      getStateField(dag.headState, genesis_validators_root),
-      block_header.slot,
-      block_root,
-      dag.validatorKey(proposer).get(),
-      data_column_sidecar.signed_block_header.signature):
-    return dag.checkedReject("DataColumnSidecar: Invalid proposer signature")
+
+  dag.verifyBlockProposer(
+    parent, block_header.slot, block_header.proposer_index, block_root,
+    data_column_sidecar.signed_block_header.signature,
+  ).isOkOr:
+    return dag.checkedReject(error.msg)
 
   # [REJECT] The sidecar's column data is valid as
   # verified by `verify_data_column_kzg_proofs(sidecar)`
@@ -656,8 +695,73 @@ proc validateDataColumnSidecar*(
       return dag.checkedReject(r.error)
 
   # Send notification about new data column sidecar via callback
-  if not(isNil(dataColumnQuarantine.onDataColumnSidecarCallback)):
-    dataColumnQuarantine.onDataColumnSidecarCallback(data_column_sidecar)
+  let onDataColumnSidecarCallback =
+    dataColumnQuarantine[].onDataColumnSidecarCallback()
+
+  if not(isNil(onDataColumnSidecarCallback)):
+    onDataColumnSidecarCallback DataColumnSidecarInfoObject(
+      block_root: block_root,
+      index: data_column_sidecar.index,
+      slot: data_column_sidecar.signed_block_header.message.slot,
+      kzg_commitments: data_column_sidecar.kzg_commitments)
+
+  ok()
+
+# https://github.com/ethereum/consensus-specs/blob/v1.6.0-beta.0/specs/gloas/p2p-interface.md#data_column_sidecar_subnet_id
+proc validateDataColumnSidecar*(
+    dag: ChainDAGRef, quarantine: ref Quarantine,
+    dataColumnQuarantine: ref ColumnQuarantine,
+    data_column_sidecar: gloas.DataColumnSidecar,
+    wallTime: BeaconTime, subnet_id: uint64):
+    Result[void, ValidationError] =
+
+  # [REJECT] The sidecar is valid as verified by verify_data_column_sidecar
+  block:
+    let v = verify_data_column_sidecar(dag.cfg, data_column_sidecar)
+    if v.isErr:
+      return dag.checkedReject(v.error)
+
+  # [REJECT] The sidecar is for the correct subnet
+  if not (compute_subnet_for_data_column_sidecar(data_column_sidecar.index) ==
+      subnet_id):
+    return dag.checkedReject("DataColumnSidecar: not for correct subnet")
+
+  # [IGNORE] Modified from Fulu: The sidecar is the first sidecar for the tuple
+  # (sidecar.beacon_block_root, sidecar.index) with valid kzg proof.
+  let block_root = data_column_sidecar.beacon_block_root
+  if dataColumnQuarantine[].hasSidecar(block_root, data_column_sidecar.index):
+    return errIgnore("DataColumnSidecar: already have valid data column")
+
+  debugGloasComment ""
+  # [IGNORE] The sidecar's beacon_block_root has been seen via a valid signed
+  # execution payload header (builder's bid).
+  #
+  # _[REJECT]_ The sidecars's `slot` matches the slot of the block with root
+  # `beacon_block_root`.
+  #
+  # [REJECT] The hash of the sidecar's kzg_commitments matches the
+  # blob_kzg_commitments_root in the corresponding builder's bid for
+  # sidecar.beacon_block_root.
+  #
+  # TODO: Implement getExecutionPayloadBid(block_root)
+  # This requires storing bids received via execution_payload_bid gossip topic,
+  # indexed by the beacon block root they commit to.
+
+  # [REJECT] The sidecar's column data is valid
+  block:
+    let r = check_data_column_sidecar_kzg_proofs(data_column_sidecar)
+    if r.isErr:
+      return dag.checkedReject(r.error)
+
+  # Send notification about new data column sidecar via callback
+  let onDataColumnSidecarCallback =
+    dataColumnQuarantine[].onDataColumnSidecarCallback()
+
+  if not(isNil(onDataColumnSidecarCallback)):
+    onDataColumnSidecarCallback DataColumnSidecarInfoObject(
+      block_root: block_root,
+      index: data_column_sidecar.index,
+      kzg_commitments: data_column_sidecar.kzg_commitments)
 
   ok()
 
@@ -676,7 +780,7 @@ proc validateBeaconBlock*(
   # signed_beacon_block.message.slot <= current_slot (a client MAY queue future
   # blocks for processing at the appropriate slot).
   if not (signed_beacon_block.message.slot <=
-      (wallTime + MAXIMUM_GOSSIP_CLOCK_DISPARITY).slotOrZero):
+      (wallTime + MAXIMUM_GOSSIP_CLOCK_DISPARITY).slotOrZero(dag.timeParams)):
     return errIgnore("BeaconBlock: slot too high")
 
   # [IGNORE] The block is from a slot greater than the latest finalized slot --
@@ -739,6 +843,7 @@ proc validateBeaconBlock*(
   # passes validation.
   let parent = dag.getBlockRef(signed_beacon_block.message.parent_root).valueOr:
     if signed_beacon_block.message.parent_root in quarantine[].unviable:
+      # If the parent was unviable, this block is unviable for the same reason
       quarantine[].addUnviable(signed_beacon_block.root)
 
       # https://github.com/ethereum/consensus-specs/blob/v1.3.0/specs/bellatrix/p2p-interface.md#beacon_block
@@ -764,26 +869,22 @@ proc validateBeaconBlock*(
 
         # Implementation restrictions:
         #
-        # - We don't know if the parent state had execution enabled.
-        #   If it had, and the block doesn't have it enabled anymore,
-        #   we end up in the pre-Merge path below (`else`) and REJECT.
-        #   Such a block is clearly invalid, though, without asking the EL.
-        #
         # - We know that the parent was marked unviable, but don't know
         #   whether it was marked unviable due to consensus (REJECT) or
         #   execution (IGNORE) verification failure. We err on the IGNORE side.
         return errIgnore("BeaconBlock: ignored, parent from unviable fork")
       else:
-        # [REJECT] The block's parent (defined by `block.parent_root`) passes
-        # validation.
-        return dag.checkedReject(
-          "BeaconBlock: rejected, parent from unviable fork")
+        # For non-execution blocks, we also don't keep track of unviable forks
+        # or invalid blocks
+        # TODO keep track of unviable invalid
+        return errIgnore("BeaconBlock: ignored, parent from unviable fork")
 
     # When the parent is missing, we can't validate the block - we'll queue it
     # in the quarantine for later processing
-    if (let r = quarantine[].addOrphan(
-        dag.finalizedHead.slot,
-        ForkedSignedBeaconBlock.init(signed_beacon_block)); r.isErr):
+    if (
+      let r = quarantine[].addOrphan(dag.finalizedHead.slot, signed_beacon_block)
+      r.isErr
+    ):
       debug "validateBeaconBlock: could not add orphan",
        blockRoot = shortLog(signed_beacon_block.root),
        blck = shortLog(signed_beacon_block.message),
@@ -833,27 +934,14 @@ proc validateBeaconBlock*(
   # against the expected shuffling, the block MAY be queued for later
   # processing while proposers for the block's branch are calculated -- in such
   # a case do not REJECT, instead IGNORE this message.
-  let
-    proposer = getProposer(
-        dag, parent, signed_beacon_block.message.slot).valueOr:
-      warn "cannot compute proposer for block"
-      return errIgnore("BeaconBlock: Cannot compute proposer") # internal issue
-
-  if uint64(proposer) != signed_beacon_block.message.proposer_index:
-    quarantine[].addUnviable(signed_beacon_block.root)
-    return dag.checkedReject("BeaconBlock: Unexpected proposer")
-
   # [REJECT] The proposer signature, signed_beacon_block.signature, is valid
   # with respect to the proposer_index pubkey.
-  if not verify_block_signature(
-      dag.forkAtEpoch(signed_beacon_block.message.slot.epoch),
-      getStateField(dag.headState, genesis_validators_root),
-      signed_beacon_block.message.slot,
-      signed_beacon_block.root,
-      dag.validatorKey(proposer).get(),
-      signed_beacon_block.signature):
-    quarantine[].addUnviable(signed_beacon_block.root)
-    return dag.checkedReject("BeaconBlock: Invalid proposer signature")
+  dag.verifyBlockProposer(
+    parent, signed_beacon_block.message.slot,
+    signed_beacon_block.message.proposer_index, signed_beacon_block.root,
+    signed_beacon_block.signature,
+  ).isOkOr:
+    return dag.checkedReject(error.msg)
 
   ok()
 
@@ -892,9 +980,11 @@ proc validateAttestation*(
   # https://github.com/ethereum/consensus-specs/blob/v1.4.0-beta.2/specs/deneb/p2p-interface.md#beacon_attestation_subnet_id
   # modifies this for Deneb and newer forks.
   block:
-    let v = check_propagation_slot_range(
-      pool.dag.cfg.consensusForkAtEpoch(wallTime.slotOrZero.epoch), slot,
-      wallTime)
+    let
+      wallEpoch = wallTime.slotOrZero(pool.dag.timeParams).epoch
+      consensusFork = pool.dag.cfg.consensusForkAtEpoch(wallEpoch)
+      v = pool.dag.timeParams.check_propagation_slot_range(
+        consensusFork, slot, wallTime)
     if v.isErr():  # [IGNORE]
       return err(v.error())
 
@@ -1035,7 +1125,8 @@ proc validateAttestation*(
     batchCrypto: ref BatchCrypto,
     attestation: SingleAttestation,
     wallTime: BeaconTime,
-    subnet_id: SubnetId, checkSignature: bool):
+    subnet_id: SubnetId, checkSignature: bool,
+    consensusFork: ConsensusFork):
     Future[Result[
       tuple[attesting_index: ValidatorIndex, beacon_committee_len: int,
             index_in_committee: int, sig: CookedSig],
@@ -1063,15 +1154,15 @@ proc validateAttestation*(
   # https://github.com/ethereum/consensus-specs/blob/v1.4.0-beta.2/specs/deneb/p2p-interface.md#beacon_attestation_subnet_id
   # modifies this for Deneb and newer forks.
   block:
-    let v = check_propagation_slot_range(
-      pool.dag.cfg.consensusForkAtEpoch(wallTime.slotOrZero.epoch), slot,
-      wallTime)
+    let v = pool.dag.timeParams.check_propagation_slot_range(
+      consensusFork, slot, wallTime)
     if v.isErr():  # [IGNORE]
       return err(v.error())
 
   # [REJECT] attestation.data.index == 0
-  if not (attestation.data.index == 0):
-    return pool.checkedReject("SingleAttestation: attestation.data.index != 0")
+  if consensusFork < ConsensusFork.Gloas:
+    if not (attestation.data.index == 0):
+      return pool.checkedReject("SingleAttestation: attestation.data.index != 0")
 
   # The block being voted for (attestation.data.beacon_block_root) has been seen
   # (via both gossip and non-gossip sources) (a client MAY queue attestations
@@ -1084,6 +1175,18 @@ proc validateAttestation*(
     if v.isErr():  # [IGNORE/REJECT]
       return pool.checkedResult(v.error)
     v.get()
+
+  # https://github.com/ethereum/consensus-specs/blob/v1.6.0-beta.0/specs/gloas/p2p-interface.md#beacon_attestation_subnet_id
+  if consensusFork >= ConsensusFork.Gloas:
+    # [REJECT] attestation.data.index < 2
+    if not (attestation.data.index < 2):
+      return pool.checkedReject("SingleAttestation: index must be < 2 in Gloas")
+
+    # [REJECT] attestation.data.index == 0 if block.slot == attestation.data.slot
+    if target.blck.bid.slot == attestation.data.slot:
+      if not (attestation.data.index == 0):
+        return pool.checkedReject(
+          "SingleAttestation: same-slot attestation must have index 0")
 
   if attestation.attester_index > high(ValidatorIndex).uint64:
     return errReject("SingleAttestation: attester index too high")
@@ -1193,11 +1296,14 @@ proc validateAttestation*(
 
 # https://github.com/ethereum/consensus-specs/blob/v1.4.0-beta.1/specs/phase0/p2p-interface.md#beacon_aggregate_and_proof
 # https://github.com/ethereum/consensus-specs/blob/v1.4.0-beta.5/specs/deneb/p2p-interface.md#beacon_aggregate_and_proof
+# https://github.com/ethereum/consensus-specs/blob/v1.5.0-beta.4/specs/electra/p2p-interface.md#beacon_aggregate_and_proof
+# https://github.com/ethereum/consensus-specs/blob/v1.6.0-beta.0/specs/gloas/p2p-interface.md#beacon_aggregate_and_proof
 proc validateAggregate*(
     pool: ref AttestationPool, batchCrypto: ref BatchCrypto,
     signedAggregateAndProof:
       phase0.SignedAggregateAndProof | electra.SignedAggregateAndProof,
-    wallTime: BeaconTime, checkSignature = true, checkCover = true):
+    wallTime: BeaconTime, checkSignature = true, checkCover = true,
+    consensusFork: ConsensusFork):
     Future[Result[
       tuple[attestingIndices: seq[ValidatorIndex], sig: CookedSig],
       ValidationError]] {.async: (raises: [CancelledError]).} =
@@ -1217,6 +1323,11 @@ proc validateAggregate*(
       return pool.checkedReject(v.error)
     v.get()
 
+  # [REJECT] aggregate.data.index == 0
+  when signedAggregateAndProof is electra.SignedAggregateAndProof:
+    if not(aggregate.data.index == 0):
+      return pool.checkedReject("Aggregate: Electra aggregate.data.index != 0")
+
   # [IGNORE] aggregate.data.slot is within the last
   # ATTESTATION_PROPAGATION_SLOT_RANGE slots (with a
   # MAXIMUM_GOSSIP_CLOCK_DISPARITY allowance) -- i.e. aggregate.data.slot +
@@ -1225,9 +1336,8 @@ proc validateAggregate*(
   # https://github.com/ethereum/consensus-specs/blob/v1.4.0-beta.2/specs/deneb/p2p-interface.md#beacon_aggregate_and_proof
   # modifies this for Deneb and newer forks.
   block:
-    let v = check_propagation_slot_range(
-      pool.dag.cfg.consensusForkAtEpoch(wallTime.slotOrZero.epoch), slot,
-      wallTime)
+    let v = pool.dag.timeParams.check_propagation_slot_range(
+      consensusFork, slot, wallTime)
     if v.isErr():  # [IGNORE]
       return err(v.error())
 
@@ -1270,6 +1380,18 @@ proc validateAggregate*(
       return pool.checkedResult(v.error)
     v.get()
 
+  when signedAggregateAndProof is electra.SignedAggregateAndProof:
+    if consensusFork >= ConsensusFork.Gloas:
+      # [REJECT] aggregate.data.index < 2
+      if not (aggregate.data.index < 2):
+        return pool.checkedReject("Aggregate: index must be < 2 in Gloas")
+
+      # [REJECT] aggregate.data.index == 0 if block.slot == aggregate.data.slot
+      if target.blck.bid.slot == aggregate.data.slot:
+        if not (aggregate.data.index == 0):
+          return pool.checkedReject(
+            "Aggregate: same-slot aggregate must have index 0")
+
   let
     shufflingRef =
       pool.dag.getShufflingRef(target.blck, target.slot.epoch, false).valueOr:
@@ -1281,11 +1403,13 @@ proc validateAggregate*(
   # [REJECT] The committee index is within the expected range -- i.e.
   # data.index < get_committee_count_per_slot(state, data.target.epoch).
   let committee_index = block:
-    when signedAggregateAndProof is electra.SignedAggregateAndProof:
+    when kind(typeof(signedAggregateAndProof)) == ConsensusFork.Electra:
+      # [REJECT] len(committee_indices) == 1, where committee_indices =
+      # get_committee_indices(aggregate)
       let agg_idx = get_committee_index_one(aggregate.committee_bits).valueOr:
         return pool.checkedReject("Aggregate: got multiple committee bits")
       let idx = shufflingRef.get_committee_index(agg_idx.uint64)
-    elif signedAggregateAndProof is phase0.SignedAggregateAndProof:
+    elif kind(typeof(signedAggregateAndProof)) == ConsensusFork.Phase0:
       let idx = shufflingRef.get_committee_index(aggregate.data.index)
     else:
       static: doAssert false
@@ -1298,13 +1422,19 @@ proc validateAggregate*(
     return pool.checkedReject(
       "Aggregate: number of aggregation bits and committee size mismatch")
 
-  if checkCover and
-      pool[].covers(aggregate.data, aggregate.aggregation_bits):
-    # [IGNORE] A valid aggregate attestation defined by
-    # `hash_tree_root(aggregate.data)` whose `aggregation_bits` is a non-strict
-    # superset has _not_ already been seen.
-    # https://github.com/ethereum/consensus-specs/pull/2847
-    return errIgnore("Aggregate: already covered")
+  # [IGNORE] A valid aggregate attestation defined by
+  # `hash_tree_root(aggregate.data)` whose `aggregation_bits` is a non-strict
+  # superset has _not_ already been seen.
+  # https://github.com/ethereum/consensus-specs/pull/2847
+  when kind(typeof(signedAggregateAndProof)) == ConsensusFork.Electra:
+    if checkCover and
+        pool[].covers(aggregate.data, aggregate.aggregation_bits,
+        aggregate.committee_bits):
+      return errIgnore("Aggregate: already covered")
+  else:
+    if checkCover and
+        pool[].covers(aggregate.data, aggregate.aggregation_bits):
+      return errIgnore("Aggregate: already covered")
 
   # [REJECT] aggregate_and_proof.selection_proof selects the validator as an
   # aggregator for the slot -- i.e. is_aggregator(state, aggregate.data.slot,
@@ -1572,7 +1702,7 @@ proc validateSyncCommitteeMessage*(
     # [IGNORE] The message's slot is for the current slot (with a
     # `MAXIMUM_GOSSIP_CLOCK_DISPARITY` allowance), i.e.
     # `sync_committee_message.slot == current_slot`.
-    let v = check_slot_exact(msg.slot, wallTime)
+    let v = dag.timeParams.check_slot_exact(msg.slot, wallTime)
     if v.isErr():
       return err(v.error())
 
@@ -1597,7 +1727,8 @@ proc validateSyncCommitteeMessage*(
     blockRoot = msg.beacon_block_root
     blck = dag.getBlockRef(blockRoot).valueOr:
       if blockRoot in quarantine[].unviable:
-        return dag.checkedReject("SyncCommitteeMessage: target invalid")
+        # TODO keep track of unviable invalid blocks
+        return errIgnore("SyncCommitteeMessage: target from unviable fork")
       quarantine[].addMissing(blockRoot)
       return errIgnore("SyncCommitteeMessage: target not found")
 
@@ -1664,7 +1795,8 @@ proc validateContribution*(
     # [IGNORE] The contribution's slot is for the current slot
     # (with a MAXIMUM_GOSSIP_CLOCK_DISPARITY allowance)
     # i.e. contribution.slot == current_slot.
-    let v = check_slot_exact(msg.message.contribution.slot, wallTime)
+    let v = dag.timeParams.check_slot_exact(
+      msg.message.contribution.slot, wallTime)
     if v.isErr():  # [IGNORE]
       return err(v.error())
 
@@ -1721,7 +1853,9 @@ proc validateContribution*(
     blockRoot = msg.message.contribution.beacon_block_root
     blck = dag.getBlockRef(blockRoot).valueOr:
       if blockRoot in quarantine[].unviable:
-        return dag.checkedReject("Contribution: target invalid")
+        # TODO keep track of unviable invalid blocks
+        return errIgnore("Contribution: target from unviable fork")
+
       quarantine[].addMissing(blockRoot)
       return errIgnore("Contribution: target not found")
 
@@ -1829,7 +1963,8 @@ proc validateLightClientFinalityUpdate*(
       else:
         GENESIS_SLOT
     currentTime = wallTime + MAXIMUM_GOSSIP_CLOCK_DISPARITY
-    forwardTime = signature_slot.light_client_finality_update_time
+    forwardTime = signature_slot
+      .light_client_finality_update_time(dag.timeParams)
   if currentTime < forwardTime:
     # [IGNORE] The `finality_update` is received after the block at
     # `signature_slot` was given enough time to propagate through the network.
@@ -1866,7 +2001,8 @@ proc validateLightClientOptimisticUpdate*(
       else:
         GENESIS_SLOT
     currentTime = wallTime + MAXIMUM_GOSSIP_CLOCK_DISPARITY
-    forwardTime = signature_slot.light_client_optimistic_update_time
+    forwardTime = signature_slot
+      .light_client_optimistic_update_time(dag.timeParams)
   if currentTime < forwardTime:
     # [IGNORE] The `optimistic_update` is received after the block at
     # `signature_slot` was given enough time to propagate through the network.

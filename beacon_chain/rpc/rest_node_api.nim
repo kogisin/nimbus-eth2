@@ -1,4 +1,5 @@
-# Copyright (c) 2021-2024 Status Research & Development GmbH
+# beacon_chain
+# Copyright (c) 2021-2025 Status Research & Development GmbH
 # Licensed and distributed under either of
 #   * MIT license (license terms in the root directory or at https://opensource.org/licenses/MIT).
 #   * Apache v2 license (license terms in the root directory or at https://www.apache.org/licenses/LICENSE-2.0).
@@ -9,7 +10,7 @@
 import
   stew/byteutils,
   chronicles,
-  eth/p2p/discoveryv5/enr,
+  eth/enr/enr,
   libp2p/[multiaddress, multicodec, peerstore],
   ../version, ../beacon_node, ../sync/sync_manager,
   ../networking/[eth2_network, peer_pool],
@@ -164,7 +165,8 @@ proc installNodeApiHandlers*(router: var RestRouter, node: BeaconNode) =
         metadata: (
           seq_number: node.network.metadata.seq_number,
           syncnets: to0xHex(node.network.metadata.syncnets.bytes),
-          attnets: to0xHex(node.network.metadata.attnets.bytes)
+          attnets: to0xHex(node.network.metadata.attnets.bytes),
+          custody_group_count: node.network.metadata.custody_group_count
         )
       )
     )
@@ -258,7 +260,7 @@ proc installNodeApiHandlers*(router: var RestRouter, node: BeaconNode) =
   # https://ethereum.github.io/beacon-APIs/#/Node/getSyncingStatus
   router.api2(MethodGet, "/eth/v1/node/syncing") do () -> RestApiResponse:
     let
-      wallSlot = node.beaconClock.now().slotOrZero()
+      wallSlot = node.currentSlot
       headSlot = node.dag.head.slot
       distance = wallSlot - headSlot
       isSyncing =
@@ -268,14 +270,14 @@ proc installNodeApiHandlers*(router: var RestRouter, node: BeaconNode) =
           node.syncManager.inProgress
       isOptimistic =
         if node.currentSlot().epoch() >= node.dag.cfg.BELLATRIX_FORK_EPOCH:
-          some(not node.dag.head.executionValid)
+          Opt.some(not node.dag.head.executionValid)
         else:
-          none[bool]()
+          Opt.none(bool)
       elOffline =
         if node.currentSlot().epoch() >= node.dag.cfg.CAPELLA_FORK_EPOCH:
-          some(not node.elManager.hasAnyWorkingConnection)
+          Opt.some(not node.elManager.hasAnyWorkingConnection)
         else:
-          none[bool]()  # Added with ethereum/beacon-APIs v2.4.0
+          Opt.none(bool)  # Added with ethereum/beacon-APIs v2.4.0
 
       info = RestSyncInfo(
         head_slot: headSlot, sync_distance: distance,

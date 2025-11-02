@@ -5,11 +5,11 @@
 #   * Apache v2 license (license terms in the root directory or at https://www.apache.org/licenses/LICENSE-2.0).
 # at your option. This file may not be copied, modified, or distributed except according to those terms.
 
-{.push raises: [].}
+{.push raises: [], gcsafe.}
 
 import
   # Standard library
-  std/[sequtils, tables],
+  std/tables,
   # Status libraries
   results, chronicles,
   # Internal
@@ -19,6 +19,7 @@ import
   ./fork_choice_types, ./proto_array,
   ../consensus_object_pools/[spec_cache, blockchain_dag]
 
+from std/sequtils import keepItIf
 export results, fork_choice_types
 export proto_array.len
 
@@ -137,8 +138,8 @@ proc on_tick(
   self.checkpoints.time = time
 
   let
-    current_slot = time.slotOrZero
-    previous_slot = previous_time.slotOrZero
+    current_slot = time.slotOrZero(dag.timeParams)
+    previous_slot = previous_time.slotOrZero(dag.timeParams)
 
   # If this is a new slot, reset store.proposer_boost_root
   if current_slot > previous_slot:
@@ -192,14 +193,14 @@ func contains*(self: ForkChoiceBackend, block_root: Eth2Digest): bool =
   ## In particular, before adding a block, its parent must be known to the fork choice
   self.proto_array.indices.contains(block_root)
 
-proc update_time*(self: var ForkChoice, dag: ChainDAGRef, time: BeaconTime):
-    FcResult[void] =
+proc update_time*(
+    self: var ForkChoice, dag: ChainDAGRef, time: BeaconTime): FcResult[void] =
   # `time` is the wall time, meaning it changes on every call typically
-  const step_size = seconds(SECONDS_PER_SLOT.int)
+  let step_size = dag.timeParams.SLOT_DURATION
   if time > self.checkpoints.time:
     let
-      preSlot = self.checkpoints.time.slotOrZero()
-      postSlot = time.slotOrZero()
+      preSlot = self.checkpoints.time.slotOrZero(dag.timeParams)
+      postSlot = time.slotOrZero(dag.timeParams)
     # Call on_tick at least once per slot.
     while time >= self.checkpoints.time + step_size:
       ? self.on_tick(dag, self.checkpoints.time + step_size)
@@ -222,9 +223,10 @@ proc on_attestation*(
        attesting_indices: openArray[ValidatorIndex],
        wallTime: BeaconTime
      ): FcResult[void] =
-  ? self.update_time(dag, max(wallTime, attestation_slot.start_beacon_time))
+  ? self.update_time(dag,
+    max(wallTime, attestation_slot.start_beacon_time(dag.timeParams)))
 
-  if attestation_slot < self.checkpoints.time.slotOrZero:
+  if attestation_slot < self.checkpoints.time.slotOrZero(dag.timeParams):
     for validator_index in attesting_indices:
       # attestation_slot and target epoch must match, per attestation rules
       self.backend.process_attestation(
@@ -270,7 +272,8 @@ proc process_block*(self: var ForkChoice,
                     unrealized: FinalityCheckpoints,
                     blck: ForkyTrustedBeaconBlock,
                     wallTime: BeaconTime): FcResult[void] =
-  ? update_time(self, dag, max(wallTime, blckRef.slot.start_beacon_time))
+  ? update_time(self, dag,
+    max(wallTime, blckRef.slot.start_beacon_time(dag.timeParams)))
 
   for attester_slashing in blck.body.attester_slashings:
     for idx in getValidatorIndices(attester_slashing):
@@ -290,9 +293,9 @@ proc process_block*(self: var ForkChoice,
     block_root = shortLog(blckRef)
 
   # Add proposer score boost if the block is timely
-  let slot = self.checkpoints.time.slotOrZero
+  let slot = self.checkpoints.time.slotOrZero(dag.timeParams)
   if slot == blck.slot and
-      self.checkpoints.time < slot.attestation_deadline and
+      self.checkpoints.time < slot.attestation_deadline(dag.timeParams) and
       self.checkpoints.proposer_boost_root == ZERO_HASH:
     self.checkpoints.proposer_boost_root = blckRef.root
 
@@ -357,14 +360,14 @@ func find_head(
 
   return ok(new_head)
 
-# https://github.com/ethereum/consensus-specs/blob/v1.4.0-beta.1/specs/phase0/fork-choice.md#get_head
+# https://github.com/ethereum/consensus-specs/blob/v1.6.0-alpha.0/specs/phase0/fork-choice.md#get_head
 proc get_head*(self: var ForkChoice,
                dag: ChainDAGRef,
                wallTime: BeaconTime): FcResult[Eth2Digest] =
   ? self.update_time(dag, wallTime)
 
   self.backend.find_head(
-    self.checkpoints.time.slotOrZero.epoch,
+    self.checkpoints.time.slotOrZero(dag.timeParams).epoch,
     FinalityCheckpoints(
       justified: self.checkpoints.justified.checkpoint,
       finalized: self.checkpoints.finalized),
@@ -487,7 +490,7 @@ when isMainModule:
     echo "    fork_choice compute_deltas - test zero votes"
 
     const validator_count = 16
-    var deltas = newSeqUninitialized[Delta](validator_count)
+    var deltas = newSeqUninit[Delta](validator_count)
 
     var indices: Table[Eth2Digest, Index]
     var votes: seq[VoteTracker]
@@ -495,7 +498,7 @@ when isMainModule:
     var new_balances: seq[Gwei]
 
     for i in 0 ..< validator_count:
-      indices.add fakeHash(i), i
+      indices[fakeHash(i)] = i
       votes.add default(VoteTracker)
       old_balances.add 0.Gwei
       new_balances.add 0.Gwei
@@ -518,7 +521,7 @@ when isMainModule:
     const
       Balance = Gwei(42)
       validator_count = 16
-    var deltas = newSeqUninitialized[Delta](validator_count)
+    var deltas = newSeqUninit[Delta](validator_count)
 
     var indices: Table[Eth2Digest, Index]
     var votes: seq[VoteTracker]
@@ -526,7 +529,7 @@ when isMainModule:
     var new_balances: seq[Gwei]
 
     for i in 0 ..< validator_count:
-      indices.add fakeHash(i), i
+      indices[fakeHash(i)] = i
       votes.add VoteTracker(
         current_root: default(Eth2Digest),
         next_root: fakeHash(0), # Get a non-zero hash
@@ -557,7 +560,7 @@ when isMainModule:
     const
       Balance = Gwei(42)
       validator_count = 16
-    var deltas = newSeqUninitialized[Delta](validator_count)
+    var deltas = newSeqUninit[Delta](validator_count)
 
     var indices: Table[Eth2Digest, Index]
     var votes: seq[VoteTracker]
@@ -565,7 +568,7 @@ when isMainModule:
     var new_balances: seq[Gwei]
 
     for i in 0 ..< validator_count:
-      indices.add fakeHash(i), i
+      indices[fakeHash(i)] = i
       votes.add VoteTracker(
         current_root: default(Eth2Digest),
         next_root: fakeHash(i), # Each vote for a different root
@@ -594,7 +597,7 @@ when isMainModule:
       Balance = Gwei(42)
       validator_count = 16
       TotalDeltas = Delta(Balance * validator_count)
-    var deltas = newSeqUninitialized[Delta](validator_count)
+    var deltas = newSeqUninit[Delta](validator_count)
 
     var indices: Table[Eth2Digest, Index]
     var votes: seq[VoteTracker]
@@ -602,7 +605,7 @@ when isMainModule:
     var new_balances: seq[Gwei]
 
     for i in 0 ..< validator_count:
-      indices.add fakeHash(i), i
+      indices[fakeHash(i)] = i
       votes.add VoteTracker(
         # Move vote from root 0 to root 1
         current_root: fakeHash(0),
@@ -639,10 +642,10 @@ when isMainModule:
     var votes: seq[VoteTracker]
 
     # Add a block
-    indices.add fakeHash(1), 0
+    indices[fakeHash(1)] = 0
 
     # 2 validators
-    var deltas = newSeqUninitialized[Delta](2)
+    var deltas = newSeqUninit[Delta](2)
     let old_balances = @[Balance, Balance]
     let new_balances = @[Balance, Balance]
 
@@ -681,7 +684,7 @@ when isMainModule:
       validator_count = 16
       TotalOldDeltas = Delta(OldBalance * validator_count)
       TotalNewDeltas = Delta(NewBalance * validator_count)
-    var deltas = newSeqUninitialized[Delta](validator_count)
+    var deltas = newSeqUninit[Delta](validator_count)
 
     var indices: Table[Eth2Digest, Index]
     var votes: seq[VoteTracker]
@@ -689,7 +692,7 @@ when isMainModule:
     var new_balances: seq[Gwei]
 
     for i in 0 ..< validator_count:
-      indices.add fakeHash(i), i
+      indices[fakeHash(i)] = i
       votes.add VoteTracker(
         # Move vote from root 0 to root 1
         current_root: fakeHash(0),
@@ -726,11 +729,11 @@ when isMainModule:
     var votes: seq[VoteTracker]
 
     # Add 2 blocks
-    indices.add fakeHash(1), 0
-    indices.add fakeHash(2), 1
+    indices[fakeHash(1)] = 0
+    indices[fakeHash(2)] = 1
 
     # 1 validator at the start, 2 at the end
-    var deltas = newSeqUninitialized[Delta](2)
+    var deltas = newSeqUninit[Delta](2)
     let old_balances = @[Balance]
     let new_balances = @[Balance, Balance]
 
@@ -765,11 +768,11 @@ when isMainModule:
     var votes: seq[VoteTracker]
 
     # Add 2 blocks
-    indices.add fakeHash(1), 0
-    indices.add fakeHash(2), 1
+    indices[fakeHash(1)] = 0
+    indices[fakeHash(2)] = 1
 
     # 2 validator at the start, 1 at the end
-    var deltas = newSeqUninitialized[Delta](2)
+    var deltas = newSeqUninit[Delta](2)
     let old_balances = @[Balance, Balance]
     let new_balances = @[Balance]
 

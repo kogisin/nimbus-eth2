@@ -36,7 +36,7 @@ export results
 # - https://notes.ethereum.org/@djrtwo/Bkn3zpwxB#Validator-responsibilities
 #
 # Phase 0 spec - Honest Validator - how to avoid slashing
-# - https://github.com/ethereum/consensus-specs/blob/v1.5.0-beta.2/specs/phase0/validator.md#how-to-avoid-slashing
+# - https://github.com/ethereum/consensus-specs/blob/v1.5.0-beta.4/specs/phase0/validator.md#how-to-avoid-slashing
 #
 # In-depth reading on slashing conditions
 #
@@ -1381,8 +1381,7 @@ proc registerSyntheticAttestation*(
     let status = db.sqlCommitTransaction.exec()
     checkStatus()
 
-proc toSPDIR*(db: SlashingProtectionDB_v2): SPDIR
-             {.raises: [IOError].} =
+proc toSPDIR*(db: SlashingProtectionDB_v2): SPDIR =
   ## Export the full slashing protection database
   ## to a json the Slashing Protection Database Interchange (Complete) Format
   result.metadata.interchange_format_version = "5"
@@ -1477,8 +1476,8 @@ proc toSPDIR*(db: SlashingProtectionDB_v2): SPDIR
           )
         doAssert status.isOk()
 
-proc inclSPDIR*(db: SlashingProtectionDB_v2, spdir: SPDIR): SlashingImportStatus
-             {.raises: [SerializationError, IOError].} =
+proc inclSPDIR*(db: SlashingProtectionDB_v2, spdir: SPDIR):
+    SlashingImportStatus =
   ## Import a Slashing Protection Database Intermediate Representation
   ## file into the specified slashing protection DB
   ##

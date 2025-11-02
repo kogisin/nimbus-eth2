@@ -49,6 +49,7 @@ The following options are available:
      --insecure-netkey-password  Use pre-generated INSECURE password for network private key file [=false].
      --agent-string            Node agent string which is used as identifier in network [=nimbus].
      --subscribe-all-subnets   Subscribe to all subnet topics when gossiping [=false].
+     --peerdas-supernode       Subscribe to all column subnets, thereby becoming a PeerDAS supernode [=false].
      --num-threads             Number of worker threads ("0" = use as many threads as there are CPU cores
                                available) [=0].
      --jwt-secret              A file containing the hex-encoded 256 bit secret key to be used for
@@ -78,7 +79,6 @@ The following options are available:
                                built-in genesis state).
      --genesis-state-url       URL for obtaining the genesis state of the network (for networks without a
                                built-in genesis state).
-     --finalized-deposit-tree-snapshot  SSZ file specifying a recent finalized EIP-4881 deposit tree snapshot.
      --node-name               A name for this node that will appear in the logs. If you set this to 'auto', a
                                persistent automatically generated ID will be selected for each --data-dir
                                folder.
@@ -116,7 +116,7 @@ The following options are available:
                                keys of the validators what to sign and when) and load the validators in the
                                beacon node itself [=true].
      --discv5                  Enable Discovery v5 [=true].
-     --dump                    Write SSZ dumps of blocks, attestations and states to data dir [=false].
+     --dump                    Write SSZ dumps of blocks and states to data dir [=false].
      --direct-peer             The list of privileged, secure and known peers to connect and maintain the
                                connection to. This requires a not random netkey-file. In the multiaddress
                                format like: /ip4/<address>/tcp/<port>/p2p/<peerId-public-key>, or enr format
@@ -183,3 +183,4 @@ Here is an example config file illustrating all of the above:
 | 0         | Successful exit                                                       |
 | 1         | Generic failure or unspecified error                                  |
 | 129       | Doppelganger detection; one might prefer not to restart automatically |
+| 198       | Slashing detection; one might prefer not to restart automatically     |

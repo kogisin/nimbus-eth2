@@ -1,3 +1,250 @@
+2025-10-31 v25.10.0
+===================
+
+Nimbus `v25.10.0` is a low-urgency release which increases the default gas limit to 60M, improves beacon API support, adds runtime configuration flexibility, and removes macOS amd64 support.
+
+### Improvements
+
+- Increase default builder API gas limit to 60M:
+  https://github.com/status-im/nimbus-eth2/pull/7555
+
+- Support `--peerdas-supernode` to require beacon node to operate as a supernode:
+  https://github.com/status-im/nimbus-eth2/pull/7629
+
+- Support runtime configuration of `SECONDS_PER_SLOT`:
+  https://github.com/status-im/nimbus-eth2/pull/7639
+  https://github.com/status-im/nimbus-eth2/pull/7643
+  https://github.com/status-im/nimbus-eth2/pull/7644
+  https://github.com/status-im/nimbus-eth2/pull/7645
+  https://github.com/status-im/nimbus-eth2/pull/7647
+  https://github.com/status-im/nimbus-eth2/pull/7652
+  https://github.com/status-im/nimbus-eth2/pull/7653
+  https://github.com/status-im/nimbus-eth2/pull/7654
+  https://github.com/status-im/nimbus-eth2/pull/7658
+  https://github.com/status-im/nimbus-eth2/pull/7661
+
+- Implement getBlobs beacon API endpoint:
+  https://github.com/status-im/nimbus-eth2/pull/7670
+
+- Ensure validator client uses non-deprecated beacon API attestation endpoints:
+  https://github.com/status-im/nimbus-eth2/pull/7642
+
+- Double trusted node sync state download timeout to 6 minutes:
+  https://github.com/status-im/nimbus-eth2/pull/7677
+
+- Make `REORG_HEAD_WEIGHT_THRESHOLD` and `REORG_MAX_EPOCHS_SINCE_FINALIZATION` runtime-configurable:
+  https://github.com/status-im/nimbus-eth2/pull/7620
+
+### Fixes
+
+- Fix consensus fork when validator client publishes attestations:
+  https://github.com/status-im/nimbus-eth2/pull/7689
+
+- Fix Nix builds:
+  https://github.com/status-im/nimbus-eth2/pull/7585
+
+- Ensure validator client always targets the correct slot:
+  https://github.com/status-im/nimbus-eth2/pull/7571
+
+- Stop using obsolete `TTFB_TIMEOUT` and `RESP_TIMEOUT` configuration:
+  https://github.com/status-im/nimbus-eth2/pull/7619
+
+2025-09-26 v25.9.2
+==================
+
+Nimbus `v25.9.2` is a `medium-urgency` stability-oriented release for mainnet and `high-urgency` release for the Hoodi, Sepolia, and Holesky testnets, due to impending Fusaka forks on each.
+
+### Fixes
+
+- Fix crash when block without blobs is unqueued from quarantine:
+  https://github.com/status-im/nimbus-eth2/pull/7543
+
+2025-09-25 v25.9.1
+==================
+
+Nimbus `v25.9.1` is a `low-urgency` release for mainnet and `high-urgency` release for the Hoodi, Sepolia, and Holesky testnets, due to impending Fusaka forks on each.
+
+### Improvements
+
+- Provide execution clients more time in certain circumstances to prepare payloads:
+  https://github.com/status-im/nimbus-eth2/pull/7457
+
+- Include BLS to execution changes under more situations in blocks:
+  https://github.com/status-im/nimbus-eth2/pull/7506
+
+- Update the validator client to use non-deprecated publishBlockV2 pre-Electra:
+  https://github.com/status-im/nimbus-eth2/pull/7438
+
+### Fixes
+
+- Fix sync sometimes getting stuck:
+  https://github.com/status-im/nimbus-eth2/pull/7491
+
+- Provide proper CORS headers for beacon API:
+  https://github.com/status-im/nimbus-eth2/pull/7473
+
+- Enable building on non-macOS ARM platforms:
+  https://github.com/status-im/nimbus-eth2/pull/7465
+
+2025-09-02 v25.9.0
+==================
+
+Nimbus `v25.9.0` is a `low-urgency` release which increases the resiliency and efficiency of block production. Furthermore, macOS amd64 releases have been deprecated and will be discontinued by October 2025.
+
+### Improvements
+
+- Allow fallback to builder API if EL provides invalid requests:
+  https://github.com/status-im/nimbus-eth2/pull/7396
+
+- Propose blocks more efficiently when the builder API is enabled:
+  https://github.com/status-im/nimbus-eth2/pull/7353
+
+- Log execution addresses more readably:
+  https://github.com/status-im/nimbus-eth2/pull/7325
+
+### Fixes
+
+- Avoid crashing on startup when data directory can't be created:
+  https://github.com/status-im/nimbus-eth2/pull/7326
+
+- Require matching Electra fork configurations between beacon node and REST clients:
+  https://github.com/status-im/nimbus-eth2/pull/7321
+  https://github.com/status-im/nimbus-eth2/pull/7322
+
+- Fix dropped connections being interpreted as empty lists during syncing:
+  https://github.com/status-im/nimbus-eth2/pull/7318
+
+2025-07-31 v25.7.1
+==================
+
+Nimbus `v25.7.1` is a `medium-urgency` release, fixing a potential syncing-related crash.
+
+### Improvements
+
+- Use Nimbus agent string for builder API calls:
+  https://github.com/status-im/nimbus-eth2/pull/7300
+
+### Fixes
+
+- Fix assertion on syncing:
+  https://github.com/status-im/nimbus-eth2/pull/7315
+
+2025-07-10 v25.7.0
+==================
+
+Nimbus `v25.7.0` is a `low-urgency` release, except for usage of the validator client with non-Nimbus beacon nodes for which it's a `medium-urgency` release.
+
+### Improvements
+
+- Increase default builder API gas limit to 45M:
+  https://github.com/status-im/nimbus-eth2/pull/7234
+
+- Ensure that validator client attests in a timely way even with partially unresponsive beacon nodes:
+  https://github.com/status-im/nimbus-eth2/pull/7276
+
+- Implement postStateValidatorIdentities beacon API endpoint:
+  https://github.com/status-im/nimbus-eth2/pull/7223
+
+- Implement getDebugDataColumnSidecars beacon API endpoint:
+  https://github.com/status-im/nimbus-eth2/pull/7237
+
+### Fixes
+
+- Fix sync-related crash regression in v25.6.0:
+  https://github.com/status-im/nimbus-eth2/pull/7275
+
+- Restore validator client compatibility with beacon nodes providing BPO schedules:
+  https://github.com/status-im/nimbus-eth2/pull/7219
+
+- Add missing `finalized` field to getStateV2 beacon API endpoint:
+  https://github.com/status-im/nimbus-eth2/pull/7248
+
+2025-06-16 v25.6.0
+==================
+
+Nimbus `v25.6.0` is a `low-urgency` release.
+
+### Improvements
+
+- Exit on first slashing of a validator for which it is responsible:
+  https://github.com/status-im/nimbus-eth2/pull/7091
+
+- Reduce the extent to which backfilling can hinder forward sync or chain progress:
+  https://github.com/status-im/nimbus-eth2/pull/7191
+
+- Prevent empty block responses from peers from causing forward sync to overshoot:
+  https://github.com/status-im/nimbus-eth2/pull/7197
+
+- Provide blocks and blobs over req/resp regardless of payload validation status:
+  https://github.com/status-im/nimbus-eth2/pull/7198
+
+- Remove deprecated Eth1Data polling for deposits in favor of EIP6110:
+  https://github.com/status-im/nimbus-eth2/pull/7114
+
+### Fixes
+
+- Implement getPendingConsolidations and add `version` field to getPendingDeposits and getPendingPartialWithdrawals beacon API endpoints:
+  https://github.com/status-im/nimbus-eth2/pull/7170
+
+- Add missing `finalized` field to getStateRandao beacon API endpoint:
+  https://github.com/status-im/nimbus-eth2/pull/7171
+
+2025-05-08 v25.5.0
+==================
+
+Nimbus `v25.5.0` does not alter the beacon node, is a low-urgency release for nodes which don't use the Nimbus validator client with a non-Nimbus BN, and a high-urgency release for nodes which do use the Nimbus validator client with a non-Nimbus beacon node.
+
+### Fixes
+
+- fix missing Eth-Consensus-Version header in validator client publishBlindedBlockV2 beacon API requests:
+  https://github.com/status-im/nimbus-eth2/pull/7140
+
+2025-04-26 v25.4.1
+==================
+
+Nimbus `v25.4.1` is a high-urgency release for Ethereum and Gnosis mainnets due to their Pectra hardforks.
+
+### Fixes
+
+- fix potential missed MEV blocks starting with Electra builder API:
+  https://github.com/status-im/nimbus-eth2/pull/7103
+
+- fix `single_attestation` SSE beacon API stream subscription:
+  https://github.com/status-im/nimbus-eth2/pull/7107
+
+2025-04-21 v25.4.0
+==================
+
+Nimbus `v25.4.0` is a high-urgency release for Ethereum and Gnosis mainnets due to their Pectra hardforks.
+
+### Improvements
+
+- Add Ethereum Foundation mainnet Pectra support:
+  https://github.com/status-im/nimbus-eth2/pull/7063
+
+- Add Gnosis mainnet Pectra support:
+  https://github.com/status-im/nimbus-eth2/pull/7062
+
+- Improve Electra attestation packing quality:
+  https://github.com/status-im/nimbus-eth2/pull/7053
+
+- Reduce unnecessary state replays on low-participation networks:
+  https://github.com/status-im/nimbus-eth2/pull/7072
+
+- Implement `block_gossip` beacon API SSE stream support:
+  https://github.com/status-im/nimbus-eth2/pull/7054
+
+- Reduce unnecessary Electra attestation logging verbosity:
+  https://github.com/status-im/nimbus-eth2/pull/7058
+
+### Fixes
+
+- Fix compatibility with certain builder API relays:
+  https://github.com/status-im/nimbus-eth2/pull/7045
+
+- Fix getAggregatedAttestationV2 beacon API endpoint for non-zero committee indices:
+  https://github.com/status-im/nimbus-eth2/pull/7037
+
 2025-03-21 v25.3.1
 ==================
 

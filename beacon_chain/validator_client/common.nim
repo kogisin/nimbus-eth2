@@ -46,10 +46,10 @@ const
 
   ZeroTimeDiff* = TimeDiff(nanoseconds: 0'i64)
 
-static: doAssert(high(ConsensusFork) == ConsensusFork.Fulu,
+static: doAssert(high(ConsensusFork) == ConsensusFork.Gloas,
           "Update OptionalForks constant!")
 const
-  OptionalForks* = {ConsensusFork.Electra, ConsensusFork.Fulu}
+  OptionalForks* = {ConsensusFork.Fulu, ConsensusFork.Gloas}
     ## When a new ConsensusFork is added and before this fork is activated on
     ## `mainnet`, it should be part of `OptionalForks`.
     ## In this case, the client will ignore missing <FORKNAME>_VERSION
@@ -233,6 +233,7 @@ type
     proposers*: ProposerMap
     syncCommitteeDuties*: SyncCommitteeDutiesMap
     syncCommitteeProofs*: SyncCommitteeProofsMap
+    timeParams*: TimeParams
     beaconGenesis*: RestGenesis
     proposerTasks*: Table[Slot, seq[ProposerTask]]
     dynamicFeeRecipientsStore*: ref DynamicFeeRecipientsStore
@@ -267,8 +268,6 @@ type
 const
   DefaultDutyAndProof* = DutyAndProof(epoch: FAR_FUTURE_EPOCH)
   DefaultSyncCommitteeDuty* = SyncCommitteeDuty()
-  SlotDuration* = int64(SECONDS_PER_SLOT).seconds
-  OneThirdDuration* = int64(SECONDS_PER_SLOT).seconds div INTERVALS_PER_SLOT
   AllBeaconNodeRoles* = {
     BeaconNodeRole.Duties,
     BeaconNodeRole.AttestationData,
@@ -312,6 +311,18 @@ const
     RestBeaconNodeStatus.BrokenClock,
     RestBeaconNodeStatus.InternalError
   }
+
+func SlotDuration*(vc: ValidatorClientRef): Duration =
+  vc.timeParams.SLOT_DURATION
+
+func SlotDurationSoft*(vc: ValidatorClientRef): Duration =
+  vc.timeParams.SLOT_DURATION div 2
+
+func OneThirdDuration*(vc: ValidatorClientRef): Duration =
+  vc.timeParams.SLOT_DURATION div INTERVALS_PER_SLOT
+
+func OneThirdDurationSoft*(vc: ValidatorClientRef): Duration =
+  (vc.timeParams.SLOT_DURATION div INTERVALS_PER_SLOT) div 2
 
 proc `$`*(to: TimeOffset): string =
   if to.value < 0:
@@ -503,32 +514,32 @@ chronicles.expandIt(SyncCommitteeDuty):
   validator_index = it.validator_index
   validator_sync_committee_indices = it.validator_sync_committee_indices
 
-proc equals*(info: VCRuntimeConfig, name: string, check: uint64): bool =
-  let numstr = info.getOrDefault(name, "missing")
-  if numstr == "missing": return false
-  let value = Base10.decode(uint64, numstr).valueOr:
+func parseConfigValue[T: uint64](_: typedesc[T], str: string): Opt[T] =
+  let res = Base10.decode(uint64, str).valueOr:
+    return Opt.none T
+  Opt.some res
+
+func parseConfigValue[T: DomainType](_: typedesc[T], str: string): Opt[T] =
+  try:
+    var res: DomainType
+    hexToByteArray(str, distinctBase(res))
+    Opt.some res
+  except ValueError:
+    Opt.none T
+
+func equals*[T](info: VCRuntimeConfig, name: string, check: T): bool =
+  let str = info.getOrDefault(name, "missing")
+  if str == "missing": return false
+  let value = T.parseConfigValue(str).valueOr:
     return false
   value == check
 
-proc equals*(info: VCRuntimeConfig, name: string, check: DomainType): bool =
-  let domstr = info.getOrDefault(name, "missing")
-  if domstr == "missing": return false
-  let value =
-    try:
-      var dres: DomainType
-      hexToByteArray(domstr, distinctBase(dres))
-      dres
-    except ValueError:
-      return false
-  value == check
-
-proc equals*(info: VCRuntimeConfig, name: string, check: Epoch): bool =
+func equals*(info: VCRuntimeConfig, name: string, check: Epoch): bool =
   info.equals(name, uint64(check))
 
-proc checkConfig*(c: VCRuntimeConfig): bool =
+func checkConfig*(c: VCRuntimeConfig): bool =
   c.equals("MAX_VALIDATORS_PER_COMMITTEE", MAX_VALIDATORS_PER_COMMITTEE) and
   c.equals("SLOTS_PER_EPOCH", SLOTS_PER_EPOCH) and
-  c.equals("SECONDS_PER_SLOT", SECONDS_PER_SLOT) and
   c.equals("EPOCHS_PER_ETH1_VOTING_PERIOD", EPOCHS_PER_ETH1_VOTING_PERIOD) and
   c.equals("SLOTS_PER_HISTORICAL_ROOT", SLOTS_PER_HISTORICAL_ROOT) and
   c.equals("EPOCHS_PER_HISTORICAL_VECTOR", EPOCHS_PER_HISTORICAL_VECTOR) and
@@ -549,6 +560,41 @@ proc checkConfig*(c: VCRuntimeConfig): bool =
   c.equals("DOMAIN_AGGREGATE_AND_PROOF", DOMAIN_AGGREGATE_AND_PROOF) and
   c.hasKey("ALTAIR_FORK_VERSION") and c.hasKey("ALTAIR_FORK_EPOCH") and
   not(c.equals("ALTAIR_FORK_EPOCH", FAR_FUTURE_EPOCH))
+
+func checkConfig*(c: VCRuntimeConfig, timeParams: TimeParams): bool =
+  c.checkConfig and (
+    # If SLOT_DURATION_MS is present, it has to match local config
+    not c.hasKey("SLOT_DURATION_MS") or
+    c.equals("SLOT_DURATION_MS", timeParams.SLOT_DURATION.milliseconds.uint64)
+  ) and (
+    # If SECONDS_PER_SLOT is present, it has to match local config
+    not c.hasKey("SECONDS_PER_SLOT") or
+    c.equals("SECONDS_PER_SLOT", timeParams.SLOT_DURATION.seconds.uint64)
+  ) and (
+    # If defaults are used, local config must also use defaults
+    (c.hasKey("SLOT_DURATION_MS") or c.hasKey("SECONDS_PER_SLOT")) or
+    timeParams.SLOT_DURATION == defaultRuntimeConfig.timeParams.SLOT_DURATION
+  )
+
+func getTimeParams*(c: VCRuntimeConfig): Opt[TimeParams] =
+  let SLOT_DURATION =
+    if c.hasKey("SLOT_DURATION_MS"):
+      let rawValue = ? uint64.parseConfigValue(
+        c.getOrDefault("SLOT_DURATION_MS", "missing"))
+      if rawValue > Duration.high.milliseconds.uint64:
+        return Opt.none TimeParams
+      milliseconds(rawValue.int64)
+    elif c.hasKey("SECONDS_PER_SLOT"):
+      let rawValue = ? uint64.parseConfigValue(
+        c.getOrDefault("SECONDS_PER_SLOT", "missing"))
+      if rawValue > Duration.high.seconds.uint64:
+        return Opt.none TimeParams
+      seconds(rawValue.int64)
+    else:
+      defaultRuntimeConfig.timeParams.SLOT_DURATION
+  if SLOT_DURATION notin MIN_SLOT_DURATION .. MAX_SLOT_DURATION:
+    return Opt.none TimeParams
+  Opt.some TimeParams(SLOT_DURATION: SLOT_DURATION)
 
 proc updateStatus*(node: BeaconNodeServerRef,
                    status: RestBeaconNodeStatus,
@@ -792,7 +838,7 @@ proc init*(t: typedesc[ProposedData], epoch: Epoch, dependentRoot: Eth2Digest,
   ProposedData(epoch: epoch, dependentRoot: dependentRoot, duties: @data)
 
 proc getCurrentSlot*(vc: ValidatorClientRef): Opt[Slot] =
-  let res = vc.beaconClock.now().toSlot()
+  let res = vc.beaconClock.now().toSlot(vc.timeParams)
   if res.afterGenesis:
     Opt.some(res.slot)
   else:
@@ -835,7 +881,8 @@ proc getDurationToNextAttestation*(vc: ValidatorClientRef,
   if minSlot == FAR_FUTURE_SLOT:
     "<unknown>"
   else:
-    $(minSlot.attestation_deadline() - slot.start_beacon_time())
+    $(minSlot.attestation_deadline(vc.timeParams) -
+      slot.start_beacon_time(vc.timeParams))
 
 proc getDurationToNextBlock*(vc: ValidatorClientRef, slot: Slot): string =
   var minSlot = FAR_FUTURE_SLOT
@@ -852,7 +899,8 @@ proc getDurationToNextBlock*(vc: ValidatorClientRef, slot: Slot): string =
   if minSlot == FAR_FUTURE_SLOT:
     "<unknown>"
   else:
-    $(minSlot.block_deadline() - slot.start_beacon_time())
+    $(minSlot.block_deadline(vc.timeParams) -
+      slot.start_beacon_time(vc.timeParams))
 
 iterator attesterDutiesForEpoch*(vc: ValidatorClientRef,
                                  epoch: Epoch): DutyAndProof =
@@ -906,6 +954,13 @@ proc forkAtEpoch*(vc: ValidatorClientRef, epoch: Epoch): Fork =
     else:
       break
   res
+
+proc getConsensusFork*(vc: ValidatorClientRef, fork: Fork): ConsensusFork =
+  doAssert(vc.forkConfig.isSome())
+  for key, value in vc.forkConfig.get().pairs():
+    if value.version == fork.current_version:
+      return key
+  raiseAssert "ForkConfig missing fork [" & $fork.current_version & "]"
 
 proc isPastElectraFork*(vc: ValidatorClientRef, epoch: Epoch): bool =
   doAssert(len(vc.forks) > 0)
@@ -965,7 +1020,7 @@ proc getSubcommitteeIndex*(index: IndexInSyncCommittee): SyncSubcommitteeIndex =
   SyncSubcommitteeIndex(uint16(index) div SYNC_SUBCOMMITTEE_SIZE)
 
 proc currentSlot*(vc: ValidatorClientRef): Slot =
-  vc.beaconClock.now().slotOrZero()
+  vc.beaconClock.now().slotOrZero(vc.timeParams)
 
 proc addValidator*(vc: ValidatorClientRef, keystore: KeystoreData) =
   let
@@ -1061,7 +1116,7 @@ proc getValidatorRegistration(
     vc: ValidatorClientRef,
     validator: AttachedValidator,
     timestamp: Time,
-    fork: Fork
+    genesis_fork_version: Version,
 ): Result[PendingValidatorRegistration, RegistrationKind] =
   if validator.index.isNone():
     debug "Validator registration missing validator index",
@@ -1091,14 +1146,14 @@ proc getValidatorRegistration(
   var registration =
     SignedValidatorRegistrationV1(
       message: ValidatorRegistrationV1(
-        fee_recipient: ExecutionAddress(data: distinctBase(feeRecipient)),
+        fee_recipient: feeRecipient,
         gas_limit: gasLimit,
         timestamp: uint64(timestamp.toUnix()),
         pubkey: validator.pubkey
       )
     )
 
-  let sigfut = validator.getBuilderSignature(fork, registration.message)
+  let sigfut = validator.getBuilderSignature(genesis_fork_version, registration.message)
   if sigfut.finished():
     # This is short-path if we able to create signature locally.
     if not(sigfut.completed()):
@@ -1120,7 +1175,7 @@ proc getValidatorRegistration(
 proc prepareRegistrationList*(
     vc: ValidatorClientRef,
     timestamp: Time,
-    fork: Fork
+    genesis_fork_version: Version,
 ): Future[seq[SignedValidatorRegistrationV1]] {.
   async: (raises: [CancelledError]).} =
 
@@ -1140,7 +1195,7 @@ proc prepareRegistrationList*(
     timed = 0
 
   for validator in vc.attachedValidators[].items():
-    let res = vc.getValidatorRegistration(validator, timestamp, fork)
+    let res = vc.getValidatorRegistration(validator, timestamp, genesis_fork_version)
     if res.isOk():
       let preg = res.get()
       if preg.future.isNil():
@@ -1221,12 +1276,13 @@ proc checkedWaitForSlot*(vc: ValidatorClientRef, destinationSlot: Slot,
      async: (raises: [CancelledError]).} =
   let
     currentTime = vc.beaconClock.now()
-    currentSlot = currentTime.slotOrZero()
+    currentSlot = currentTime.slotOrZero(vc.timeParams)
     chronosOffset = chronos.nanoseconds(
       if offset.nanoseconds < 0: 0'i64 else: offset.nanoseconds)
 
-  var timeToSlot = (destinationSlot.start_beacon_time() - currentTime) +
-                   chronosOffset
+  var timeToSlot =
+    (destinationSlot.start_beacon_time(vc.timeParams) - currentTime) +
+    chronosOffset
 
   logScope:
     start_time = shortLog(currentTime)
@@ -1235,11 +1291,11 @@ proc checkedWaitForSlot*(vc: ValidatorClientRef, destinationSlot: Slot,
     time_to_slot = shortLog(timeToSlot)
 
   while true:
-    await sleepAsync2(timeToSlot)
+    await sleepAsync(timeToSlot)
 
     let
       wallTime = vc.beaconClock.now()
-      wallSlot = wallTime.slotOrZero()
+      wallSlot = wallTime.slotOrZero(vc.timeParams)
 
     logScope:
       wall_time = shortLog(wallTime)
@@ -1259,8 +1315,9 @@ proc checkedWaitForSlot*(vc: ValidatorClientRef, destinationSlot: Slot,
       else:
         # Time moved back by a single slot - this could be a minor adjustment,
         # for example when NTP does its thing after not working for a while
-        timeToSlot = destinationSlot.start_beacon_time() - wallTime +
-                     chronosOffset
+        timeToSlot =
+          (destinationSlot.start_beacon_time(vc.timeParams) - wallTime) +
+          chronosOffset
         if showLogs:
           warn "System time adjusted backwards, rescheduling slot actions"
         continue
@@ -1283,20 +1340,16 @@ proc checkedWaitForNextSlot*(vc: ValidatorClientRef, curSlot: Opt[Slot],
                              showLogs: bool): Future[Opt[Slot]] {.
      async: (raises: [CancelledError], raw: true).} =
   let
-    currentTime = vc.beaconClock.now()
-    currentSlot = curSlot.valueOr: currentTime.slotOrZero()
+    currentSlot = curSlot.valueOr: vc.currentSlot()
     nextSlot = currentSlot + 1
-
   vc.checkedWaitForSlot(nextSlot, offset, showLogs)
 
 proc checkedWaitForNextSlot*(vc: ValidatorClientRef, offset: TimeDiff,
                              showLogs: bool): Future[Opt[Slot]] {.
      async: (raises: [CancelledError], raw: true).} =
   let
-    currentTime = vc.beaconClock.now()
-    currentSlot = currentTime.slotOrZero()
+    currentSlot = vc.currentSlot()
     nextSlot = currentSlot + 1
-
   vc.checkedWaitForSlot(nextSlot, offset, showLogs)
 
 proc expectBlock*(vc: ValidatorClientRef, slot: Slot,
@@ -1325,7 +1378,7 @@ proc registerBlock*(vc: ValidatorClientRef, eblck: EventBeaconBlockObject,
                     node: BeaconNodeServerRef) =
   let
     wallTime = vc.beaconClock.now()
-    delay = wallTime - eblck.slot.start_beacon_time()
+    delay = wallTime - eblck.slot.start_beacon_time(vc.timeParams)
 
   debug "Block received", slot = eblck.slot,
         block_root = shortLog(eblck.block_root), optimistic = eblck.optimistic,
@@ -1368,7 +1421,8 @@ proc waitForBlock*(
   ## by the beacon node.
   let
     startTime = Moment.now()
-    waitTime = (start_beacon_time(slot) + timediff) - vc.beaconClock.now()
+    waitTime =
+      (slot.start_beacon_time(vc.timeParams) + timediff) - vc.beaconClock.now()
 
   logScope:
     slot = slot
@@ -1444,7 +1498,9 @@ proc waitForNextEpoch*(service: ClientServiceRef,
      async: (raises: [CancelledError], raw: true) .}=
   let
     vc = service.client
-    sleepTime = vc.beaconClock.durationToNextEpoch() + delay
+    currentSlot = vc.beaconClock.now().toSlot(vc.timeParams)
+    nextEpochTime = currentSlot.nextEpochStartTime(vc.timeParams)
+    sleepTime = vc.beaconClock.fromNow(nextEpochTime).durationOrZero() + delay
   debug "Sleeping until next epoch", service = service.name,
                                      sleep_time = sleepTime, delay = delay
   sleepAsync(sleepTime)
@@ -1453,12 +1509,21 @@ proc waitForNextEpoch*(service: ClientServiceRef): Future[void] {.
      async: (raises: [CancelledError], raw: true).}=
   waitForNextEpoch(service, ZeroDuration)
 
+proc waitForNextSlot*(
+       vc: ValidatorClientRef,
+       currentSlot: tuple[afterGenesis: bool, slot: Slot]
+     ): Future[void] {.async: (raises: [CancelledError], raw: true).} =
+  let
+    nextSlotTime = currentSlot.nextSlotStartTime(vc.timeParams)
+    sleepTime = vc.beaconClock.fromNow(nextSlotTime).durationOrZero()
+  sleepAsync(sleepTime)
+
 proc waitForNextSlot*(service: ClientServiceRef): Future[void] {.
      async: (raises: [CancelledError], raw: true).} =
   let
     vc = service.client
-    sleepTime = vc.beaconClock.durationToNextSlot()
-  sleepAsync(sleepTime)
+    currentSlot = vc.beaconClock.now().toSlot(vc.timeParams)
+  service.client.waitForNextSlot(currentSlot)
 
 func compareUnsorted*[T](a, b: openArray[T]): bool =
   if len(a) != len(b):

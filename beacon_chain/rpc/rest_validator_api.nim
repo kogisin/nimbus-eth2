@@ -1,10 +1,11 @@
+# beacon_chain
 # Copyright (c) 2018-2025 Status Research & Development GmbH
 # Licensed and distributed under either of
 #   * MIT license (license terms in the root directory or at https://opensource.org/licenses/MIT).
 #   * Apache v2 license (license terms in the root directory or at https://www.apache.org/licenses/LICENSE-2.0).
 # at your option. This file may not be copied, modified, or distributed except according to those terms.
 
-{.push raises: [].}
+{.push raises: [], gcsafe.}
 
 import std/[typetraits, sets, sequtils]
 import stew/base10, chronicles
@@ -12,7 +13,7 @@ import ".."/[beacon_chain_db, beacon_node],
        ".."/networking/eth2_network,
        ".."/consensus_object_pools/[blockchain_dag, spec_cache,
                                     attestation_pool, sync_committee_msg_pool],
-       ".."/validators/beacon_validators,
+       ".."/validators/[beacon_validators, block_payloads],
        ".."/spec/[beaconstate, forks, network, state_transition_block],
        "."/[rest_utils, state_ttl_cache]
 
@@ -58,7 +59,7 @@ proc installValidatorApiHandlers*(router: var RestRouter, node: BeaconNode) =
         let
           res = epoch.get()
           wallTime = node.beaconClock.now() + MAXIMUM_GOSSIP_CLOCK_DISPARITY
-          wallEpoch = wallTime.slotOrZero().epoch
+          wallEpoch = wallTime.slotOrZero(node.dag.timeParams).epoch
         if res > wallEpoch + 1:
           return RestApiResponse.jsonError(Http400, InvalidEpochValueError,
                                         "Cannot request duties past next epoch")
@@ -119,7 +120,7 @@ proc installValidatorApiHandlers*(router: var RestRouter, node: BeaconNode) =
         let
           res = epoch.get()
           wallTime = node.beaconClock.now() + MAXIMUM_GOSSIP_CLOCK_DISPARITY
-          wallEpoch = wallTime.slotOrZero().epoch
+          wallEpoch = wallTime.slotOrZero(node.dag.timeParams).epoch
         if res > wallEpoch + 1:
           return RestApiResponse.jsonError(Http400, InvalidEpochValueError,
                                         "Cannot request duties past next epoch")
@@ -213,7 +214,7 @@ proc installValidatorApiHandlers*(router: var RestRouter, node: BeaconNode) =
           # If the requested validator index was not valid within this old
           # state, it's not possible that it will sit on the sync committee.
           # Since this API must omit results for validators that don't have
-          # duties, we can simply ingnore this requested index.
+          # duties, we can simply ignore this requested index.
           # (we won't bother to validate it against a more recent state).
           continue
 
@@ -331,24 +332,6 @@ proc installValidatorApiHandlers*(router: var RestRouter, node: BeaconNode) =
     RestApiResponse.jsonError(
       Http410, DeprecatedRemovalProduceBlindedBlockV1)
 
-  func getMaybeBlindedHeaders(
-      consensusFork: ConsensusFork,
-      isBlinded: bool,
-      executionValue: Opt[UInt256],
-      consensusValue: Opt[UInt256]): HttpTable =
-    var res = HttpTable.init()
-    res.add("eth-consensus-version", consensusFork.toString())
-    if isBlinded:
-      res.add("eth-execution-payload-blinded", "true")
-    else:
-      res.add("eth-execution-payload-blinded", "false")
-    if executionValue.isSome():
-      res.add(
-        "eth-execution-payload-value", toString(executionValue.get(), 10))
-    if consensusValue.isSome():
-      res.add("eth-consensus-block-value", toString(consensusValue.get(), 10))
-    res
-
   # https://ethereum.github.io/beacon-APIs/#/Validator/produceBlockV3
   router.api(MethodGet, "/eth/v3/validator/blocks/{slot}") do (
       slot: Slot, randao_reveal: Option[ValidatorSig],
@@ -367,9 +350,8 @@ proc installValidatorApiHandlers*(router: var RestRouter, node: BeaconNode) =
         if res <= node.dag.finalizedHead.slot:
           return RestApiResponse.jsonError(Http400, InvalidSlotValueError,
                                            "Slot already finalized")
-        let wallTime =
-          node.beaconClock.now() + MAXIMUM_GOSSIP_CLOCK_DISPARITY
-        if res > wallTime.slotOrZero:
+        let wallTime = node.beaconClock.now() + MAXIMUM_GOSSIP_CLOCK_DISPARITY
+        if res > wallTime.slotOrZero(node.dag.timeParams):
           return RestApiResponse.jsonError(Http400, InvalidSlotValueError,
                                            "Slot cannot be in the future")
         res
@@ -429,66 +411,74 @@ proc installValidatorApiHandlers*(router: var RestRouter, node: BeaconNode) =
       return RestApiResponse.jsonError(Http400, InvalidRandaoRevealValue)
 
     withConsensusFork(node.dag.cfg.consensusForkAtEpoch(qslot.epoch)):
-      when consensusFork >= ConsensusFork.Deneb:
+      when consensusFork >= ConsensusFork.Gloas:
+        # https://github.com/ethereum/beacon-APIs/pull/552 notes that
+        # produceBlockV3 won't work past Fulu.
+        return RestApiResponse.jsonError(
+          Http500, "Unsupported fork for block production: " & $consensusFork)
+      elif consensusFork >= ConsensusFork.Electra:
         let
           message = (await node.makeMaybeBlindedBeaconBlockForHeadAndSlot(
-              consensusFork, qrandao, qgraffiti, qhead, qslot,
+              consensusFork, proposer, qrandao, qgraffiti, qhead, qslot,
               qboostFactor)).valueOr:
             # HTTP 400 error is only for incorrect parameters.
             return RestApiResponse.jsonError(Http500, error)
-          headers = consensusFork.getMaybeBlindedHeaders(
-            message.blck.isBlinded,
-            message.executionValue,
-            message.consensusValue)
 
         if contentType == sszMediaType:
           if message.blck.isBlinded:
-            RestApiResponse.sszResponse(message.blck.blindedData, headers)
+            RestApiResponse.sszResponse(
+              message.blck.blindedData, consensusFork, isBlinded = true,
+              message.executionValue, message.consensusValue,
+              node.hasRestAllowedOrigin)
           else:
-            RestApiResponse.sszResponse(message.blck.data, headers)
+            RestApiResponse.sszResponse(
+              message.blck.data, consensusFork, isBlinded = false,
+              message.executionValue, message.consensusValue,
+              node.hasRestAllowedOrigin)
         elif contentType == jsonMediaType:
           let forked =
             if message.blck.isBlinded:
               ForkedMaybeBlindedBeaconBlock.init(
                 message.blck.blindedData,
-                message.executionValue,
-                message.consensusValue)
+                Opt.some message.executionValue,
+                Opt.some message.consensusValue)
             else:
               ForkedMaybeBlindedBeaconBlock.init(
                 message.blck.data,
-                message.executionValue,
-                message.consensusValue)
-          RestApiResponse.jsonResponsePlain(forked, headers)
+                Opt.some message.executionValue,
+                Opt.some message.consensusValue)
+          RestApiResponse.jsonResponsePlain(
+            forked, consensusFork, message.blck.isBlinded,
+            message.executionValue, message.consensusValue,
+            node.hasRestAllowedOrigin)
+        else:
+          raiseAssert "preferredContentType() returns invalid content type"
+      elif consensusFork >= ConsensusFork.Bellatrix:
+        let
+          message = (await node.makeBeaconBlockForHeadAndSlot(
+              consensusFork, proposer, qrandao, qgraffiti, qhead, qslot)).valueOr:
+            return RestApiResponse.jsonError(Http500, error)
+
+        if contentType == sszMediaType:
+          RestApiResponse.sszResponse(
+            message.blck, consensusFork, isBlinded = false,
+            message.executionValue, message.consensusValue,
+            node.hasRestAllowedOrigin)
+        elif contentType == jsonMediaType:
+          let forked = ForkedMaybeBlindedBeaconBlock.init(
+            message.blck,
+            Opt.some message.executionValue,
+            Opt.some message.consensusValue)
+
+          RestApiResponse.jsonResponsePlain(
+            forked, consensusFork, isBlinded = false,
+            message.executionValue, message.consensusValue,
+            node.hasRestAllowedOrigin)
         else:
           raiseAssert "preferredContentType() returns invalid content type"
       else:
-        when consensusFork >= ConsensusFork.Bellatrix:
-          type PayloadType = consensusFork.ExecutionPayloadForSigning
-        else:
-          type PayloadType = bellatrix.ExecutionPayloadForSigning
-        let
-          message = (await PayloadType.makeBeaconBlockForHeadAndSlot(
-              node, qrandao, proposer, qgraffiti, qhead, qslot)).valueOr:
-            return RestApiResponse.jsonError(Http500, error)
-          executionValue = Opt.some(message.executionPayloadValue)
-          consensusValue = Opt.some(message.consensusBlockValue)
-          headers = consensusFork.getMaybeBlindedHeaders(
-            isBlinded = false, executionValue, consensusValue)
-
-        doAssert message.blck.kind == consensusFork
-        template forkyBlck: untyped = message.blck.forky(consensusFork)
-        if contentType == sszMediaType:
-          RestApiResponse.sszResponse(forkyBlck, headers)
-        elif contentType == jsonMediaType:
-          let forked =
-            when consensusFork >= ConsensusFork.Bellatrix:
-              ForkedMaybeBlindedBeaconBlock.init(
-                forkyBlck, executionValue, consensusValue)
-            else:
-              ForkedMaybeBlindedBeaconBlock.init(forkyBlck)
-          RestApiResponse.jsonResponsePlain(forked, headers)
-        else:
-          raiseAssert "preferredContentType() returns invalid content type"
+        return RestApiResponse.jsonError(
+          Http500, "Unsupported fork for block production: " & $consensusFork)
 
   # https://ethereum.github.io/beacon-APIs/#/Validator/produceAttestationData
   router.api2(MethodGet, "/eth/v1/validator/attestation_data") do (
@@ -510,11 +500,12 @@ proc installValidatorApiHandlers*(router: var RestRouter, node: BeaconNode) =
                                            "Slot already finalized")
         let
           wallTime = node.beaconClock.now()
-        if qslot > (wallTime + MAXIMUM_GOSSIP_CLOCK_DISPARITY).slotOrZero:
+          maxTime = wallTime + MAXIMUM_GOSSIP_CLOCK_DISPARITY
+        if qslot > maxTime.slotOrZero(node.dag.timeParams):
           return RestApiResponse.jsonError(
             Http400, InvalidSlotValueError, "Slot cannot be in the future")
-        if qslot + SLOTS_PER_EPOCH <
-            (wallTime - MAXIMUM_GOSSIP_CLOCK_DISPARITY).slotOrZero:
+        if qslot + SLOTS_PER_EPOCH < (wallTime - MAXIMUM_GOSSIP_CLOCK_DISPARITY)
+            .slotOrZero(node.dag.timeParams):
           return RestApiResponse.jsonError(
             Http400, InvalidSlotValueError,
             "Slot cannot be more than an epoch in the past")
@@ -644,8 +635,7 @@ proc installValidatorApiHandlers*(router: var RestRouter, node: BeaconNode) =
                 UnableToGetAggregatedAttestationError)
           ForkedAttestation.init(phase0_attestation, qfork)
 
-    let headers = HttpTable.init([("eth-consensus-version", qfork.toString())])
-    RestApiResponse.jsonResponsePlain(forked, headers)
+    RestApiResponse.jsonResponsePlain(forked, qfork, node.hasRestAllowedOrigin)
 
   # https://ethereum.github.io/beacon-APIs/#/Validator/publishAggregateAndProofs
   router.api2(MethodPost, "/eth/v1/validator/aggregate_and_proofs") do (
@@ -689,7 +679,7 @@ proc installValidatorApiHandlers*(router: var RestRouter, node: BeaconNode) =
       return RestApiResponse.jsonError(Http400, EmptyRequestBodyError)
 
     let
-      headerVersion = request.headers.getString("Eth-Consensus-Version")
+      headerVersion = request.headers.getString("eth-consensus-version")
       consensusVersion = ConsensusFork.init(headerVersion)
     if consensusVersion.isNone():
       return RestApiResponse.jsonError(Http400, FailedToObtainConsensusForkError)
@@ -707,7 +697,7 @@ proc installValidatorApiHandlers*(router: var RestRouter, node: BeaconNode) =
     case consensusVersion.get():
       of ConsensusFork.Phase0 .. ConsensusFork.Deneb:
         addDecodedProofs(phase0.SignedAggregateAndProof)
-      of ConsensusFork.Electra .. ConsensusFork.Fulu:
+      of ConsensusFork.Electra .. ConsensusFork.Gloas:
         addDecodedProofs(electra.SignedAggregateAndProof)
 
     await allFutures(proofs)
@@ -743,7 +733,7 @@ proc installValidatorApiHandlers*(router: var RestRouter, node: BeaconNode) =
       return RestApiResponse.jsonError(Http503, BeaconNodeInSyncError)
 
     let
-      wallSlot = node.beaconClock.now.slotOrZero
+      wallSlot = node.currentSlot
       wallEpoch = wallSlot.epoch
       head = node.dag.head
 
@@ -969,7 +959,7 @@ proc installValidatorApiHandlers*(router: var RestRouter, node: BeaconNode) =
             return RestApiResponse.jsonError(Http400,
                                              InvalidPrepareBeaconProposerError)
           dres.get()
-      currentEpoch = node.beaconClock.now.slotOrZero.epoch
+      currentEpoch = node.currentSlot.epoch
 
     var
       numUpdated = 0
